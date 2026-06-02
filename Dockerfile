@@ -19,8 +19,8 @@ RUN apt-get update && apt-get install -y \
 
 # Copy the entire PotreeConverter build output (binary + shared libraries)
 COPY --from=build /src/build /opt/potree
-# Put the binary on PATH and tell the linker where its .so files live
-RUN ln -s /opt/potree/PotreeConverter /usr/local/bin/PotreeConverter
+# The worker calls /opt/potree/PotreeConverter by absolute path (no symlink, so the
+# binary resolves its own resources correctly). Tell the linker where its .so files live.
 ENV LD_LIBRARY_PATH=/opt/potree
 
 WORKDIR /app
