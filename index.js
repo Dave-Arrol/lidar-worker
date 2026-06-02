@@ -6,10 +6,27 @@ const fsp = require('fs/promises')
 const path = require('path')
 const os = require('os')
 
-const {
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, WORKER_SECRET,
-  RAW_BUCKET = 'lidar-raw', OCTREE_BUCKET = 'lidar-octree', PORT = 8080,
-} = process.env
+// Clean env values: strip whitespace/newlines and any surrounding quotes
+function clean(v) {
+  if (!v) return ''
+  return v.trim().replace(/^['\"]|['\"]$/g, '').trim()
+}
+
+const SUPABASE_URL = clean(process.env.SUPABASE_URL)
+const SUPABASE_SERVICE_ROLE_KEY = clean(process.env.SUPABASE_SERVICE_ROLE_KEY)
+const WORKER_SECRET = clean(process.env.WORKER_SECRET)
+const RAW_BUCKET = clean(process.env.RAW_BUCKET) || 'lidar-raw'
+const OCTREE_BUCKET = clean(process.env.OCTREE_BUCKET) || 'lidar-octree'
+const PORT = clean(process.env.PORT) || 8080
+
+// Helpful diagnostics on boot (does NOT print secrets)
+console.log('ENV check -> SUPABASE_URL:', SUPABASE_URL ? `set (${SUPABASE_URL.length} chars, starts ${SUPABASE_URL.slice(0,8)})` : 'MISSING')
+console.log('ENV check -> SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? `set (${SUPABASE_SERVICE_ROLE_KEY.length} chars)` : 'MISSING')
+console.log('ENV check -> WORKER_SECRET:', WORKER_SECRET ? 'set' : 'MISSING')
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('FATAL: Supabase env vars not found. Check Railway Variables names match exactly: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY')
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 const app = express()
