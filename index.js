@@ -66,7 +66,7 @@ async function runJob(jobId, rawPath) {
   await fsp.writeFile(inFile, Buffer.from(await data.arrayBuffer()))
 
   // 2. convert to Potree octree
-  await run('PotreeConverter', [inFile, '-o', outDir])
+  await run('/opt/potree/PotreeConverter', [inFile, '-o', outDir])
 
   // 3. upload octree files
   const files = await fsp.readdir(outDir)
