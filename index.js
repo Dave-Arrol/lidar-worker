@@ -48,8 +48,16 @@ app.post('/process', (req, res) => {
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { maxBuffer: 1024 * 1024 * 64 }, (err, stdout, stderr) =>
-      err ? reject(new Error(stderr || err.message)) : resolve(stdout))
+    execFile(cmd, args, { maxBuffer: 1024 * 1024 * 64 }, (err, stdout, stderr) => {
+      if (stdout) console.log('[stdout]', stdout)
+      if (stderr) console.log('[stderr]', stderr)
+      if (err) {
+        const detail = [stderr, stdout, err.message].filter(Boolean).join(' | ')
+        reject(new Error(detail))
+      } else {
+        resolve(stdout)
+      }
+    })
   })
 }
 
@@ -60,13 +68,28 @@ async function runJob(jobId, rawPath) {
   const inFile = path.join(work, path.basename(rawPath))
   const outDir = path.join(work, 'octree')
 
-  // 1. download LAZ
-  const { data, error } = await supabase.storage.from(RAW_BUCKET).download(rawPath)
-  if (error) throw error
-  await fsp.writeFile(inFile, Buffer.from(await data.arrayBuffer()))
+  // 1. download LAZ by streaming to disk (avoids Node's 2 GiB single-buffer limit)
+  const { data: signed, error: signErr } = await supabase.storage
+    .from(RAW_BUCKET).createSignedUrl(rawPath, 3600)
+  if (signErr) throw signErr
+  const resp = await fetch(signed.signedUrl)
+  if (!resp.ok || !resp.body) throw new Error(`download failed: ${resp.status}`)
+  await new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(inFile)
+    const reader = resp.body.getReader()
+    const pump = () => reader.read().then(({ done, value }) => {
+      if (done) { out.end(); return }
+      out.write(Buffer.from(value), (err) => err ? reject(err) : pump())
+    }).catch(reject)
+    out.on('finish', resolve)
+    out.on('error', reject)
+    pump()
+  })
 
   // 2. convert to Potree octree
-  await run('/opt/potree/PotreeConverter', [inFile, '-o', outDir])
+  // -m poisson is faster but memory-hungry; on constrained containers, the
+  // "unsuitable" sampling + lower point density keeps RAM down for big clouds.
+  await run('/opt/potree/PotreeConverter', [inFile, '-o', outDir, '--encoding', 'BROTLI'])
 
   // 3. upload octree files
   const files = await fsp.readdir(outDir)
