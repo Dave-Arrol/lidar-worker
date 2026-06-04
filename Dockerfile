@@ -1,4 +1,4 @@
-# Builds PotreeConverter 2.x + GDAL, then runs the Node worker.
+# Builds PotreeConverter + GDAL + Python analysis stack, then runs the Node worker.
 FROM ubuntu:22.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -6,27 +6,33 @@ RUN apt-get update && apt-get install -y \
 RUN git clone --depth 1 https://github.com/potree/PotreeConverter.git /src
 WORKDIR /src
 RUN mkdir build && cd build && cmake .. && make -j$(nproc)
-# Build outputs: the PotreeConverter binary AND its shared libs (liblaszip.so etc.)
-# all land in /src/build. We copy the whole build dir so nothing is missed.
 
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     curl ca-certificates gdal-bin libtbb-dev \
+    python3 python3-pip python3-dev build-essential swig cmake \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the entire PotreeConverter build output (binary + shared libraries)
+# Python analysis libraries (CSF = cloth-simulation-filter ground filter)
+# Full algorithmic-pipeline stack (segmentation needs scikit-image; dbh/stem need
+# scikit-learn + pandas; plots need matplotlib, headless via MPLBACKEND=Agg)
+RUN pip3 install --no-cache-dir \
+    "laspy[lazrs]==2.7.0" cloth-simulation-filter==1.1.7 \
+    numpy scipy scikit-image scikit-learn pandas matplotlib rasterio
+ENV MPLBACKEND=Agg
+
+# PotreeConverter (binary + its shared libs) — worker calls it by absolute path
 COPY --from=build /src/build /opt/potree
-# The worker calls /opt/potree/PotreeConverter by absolute path (no symlink, so the
-# binary resolves its own resources correctly). Tell the linker where its .so files live.
 ENV LD_LIBRARY_PATH=/opt/potree
 
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
-COPY index.js ./
+COPY index.js registry.js ./
+COPY scripts ./scripts
 ENV PORT=8080
 EXPOSE 8080
 CMD ["node", "index.js"]
