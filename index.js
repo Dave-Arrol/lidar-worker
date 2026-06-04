@@ -107,8 +107,10 @@ async function handleRaster(file, output, siteId, type) {
   let toWarp = file, comp = ['-co', 'COMPRESS=DEFLATE']
   if (info.bands.length === 1) {
     const b = info.bands[0], lo = b.computedMin, hi = b.computedMax, rng = (hi - lo) || 1
-    const stops = [[lo, '43 106 63'], [lo + 0.25 * rng, '116 164 75'], [lo + 0.5 * rng, '232 212 77'],
-                   [lo + 0.75 * rng, '168 106 51'], [hi, '245 245 245']]
+    const stops = output.mode === 'grey'
+      ? [[lo, '0 0 0'], [hi, '255 255 255']]
+      : [[lo, '43 106 63'], [lo + 0.25 * rng, '116 164 75'], [lo + 0.5 * rng, '232 212 77'],
+         [lo + 0.75 * rng, '168 106 51'], [hi, '245 245 245']]
     const ramp = path.join(work, 'ramp.txt')
     await fsp.writeFile(ramp, 'nv 0 0 0 0\n' + stops.map(s => `${s[0]} ${s[1]} 255`).join('\n') + '\n')
     const col = path.join(work, 'col.tif')
