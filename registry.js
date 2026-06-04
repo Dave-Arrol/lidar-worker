@@ -30,6 +30,35 @@ const REGISTRY = [
     ],
   },
   {
+    id: 'chm',
+    label: 'Canopy height model',
+    description: 'Max canopy height raster from the normalised cloud.',
+    dependsOn: ['normalise'],
+    script: 'chm.py',
+    args: (c) => ['--input', c.f('normalised.las'),
+                  '--out-tif', c.f('chm.tif'),
+                  '--out-summary', c.f('chm_summary.json')],
+    outputs: [
+      { role: 'raster',  file: 'chm.tif',          name: 'Canopy height' },
+      { role: 'summary', file: 'chm_summary.json', name: 'summary' },
+    ],
+  },
+  {
+    id: 'dtm',
+    label: 'DTM hillshade',
+    description: 'Greyscale hillshade of the CSF ground surface.',
+    dependsOn: ['normalise'],
+    script: 'dtm.py',
+    // mode:'grey' tells the worker to use a black->white ramp (not the CHM green ramp)
+    args: (c) => ['--input', c.f('ground.csv'),
+                  '--out-tif', c.f('dtm_hillshade.tif'),
+                  '--out-summary', c.f('dtm_summary.json')],
+    outputs: [
+      { role: 'raster',  file: 'dtm_hillshade.tif', name: 'DTM hillshade', mode: 'grey' },
+      { role: 'summary', file: 'dtm_summary.json',   name: 'summary' },
+    ],
+  },
+  {
     id: 'treetops',
     label: 'Tree tops (quick)',
     description: 'Lightweight standalone tree-top detection (no segmentation).',
