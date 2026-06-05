@@ -96,14 +96,14 @@ const REGISTRY = [
   {
     id: 'density',
     label: 'Tree density',
-    description: 'Stem density (trees/ha) on a 10 m grid, from the tree tops.',
+    description: 'Stem density (trees/ha) as hexagon bins (~100 m² / 0.01 ha), from the tree tops.',
     dependsOn: ['treetops'],
     script: 'tree_density.py',
     args: (c) => ['--input', c.f('treetops_std.csv'),
-                  '--out-tif', c.f('tree_density.tif'),
+                  '--out-geojson', c.f('tree_density.geojson'),
                   '--out-summary', c.f('tree_density_summary.json')],
     outputs: [
-      { role: 'raster',  file: 'tree_density.tif',          name: 'Tree density', kind: 'density', mode: 'density' },
+      { role: 'vector',  file: 'tree_density.geojson',     name: 'Tree density', kind: 'density' },
       { role: 'summary', file: 'tree_density_summary.json', name: 'summary' },
     ],
   },
