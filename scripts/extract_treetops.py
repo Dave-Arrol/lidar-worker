@@ -32,6 +32,7 @@ from pathlib import Path
 
 import laspy
 import numpy as np
+from rasterio.warp import transform as warp_transform
 from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.spatial import cKDTree
 
@@ -44,6 +45,8 @@ def parse_args():
     ap.add_argument('--out-csv',     required=True, help='Output tree-tops .csv (tree_id,x,y,height_m).')
     ap.add_argument('--out-las',     required=True, help='Output tree-tops .las (one point per tree, id-coloured).')
     ap.add_argument('--out-summary', required=True, help='Output summary .json (tree count + height stats).')
+    ap.add_argument('--out-geojson', required=True, help='Output tree-tops GeoJSON (EPSG:4326) for the 2D map.')
+    ap.add_argument('--crs',         default='EPSG:27700', help='CRS of the input X/Y. Default EPSG:27700.')
     # Detection parameters (defaults = original SETTINGS; must match segmentation_v2)
     ap.add_argument('--chm-resolution',  type=float, default=0.3,  help='Metres per CHM pixel. Default 0.3.')
     ap.add_argument('--gaussian-sigma',  type=float, default=1.0,  help='CHM smoothing sigma. Default 1.0.')
@@ -143,6 +146,7 @@ def main():
     csv_file     = Path(a.out_csv)
     las_file     = Path(a.out_las)
     summary_file = Path(a.out_summary)
+    geojson_file = Path(a.out_geojson)
 
     if not input_file.exists():
         raise FileNotFoundError(f"Input file not found: {input_file}")
@@ -150,6 +154,7 @@ def main():
     csv_file.parent.mkdir(parents=True, exist_ok=True)
     las_file.parent.mkdir(parents=True, exist_ok=True)
     summary_file.parent.mkdir(parents=True, exist_ok=True)
+    geojson_file.parent.mkdir(parents=True, exist_ok=True)
 
     chm_res  = a.chm_resolution
     sigma    = a.gaussian_sigma
@@ -251,6 +256,17 @@ def main():
     with open(summary_file, "w") as f:
         json.dump(summary, f)
     print(f"  Summary JSON:    {summary_file}")
+
+    # ── GeoJSON (reprojected to EPSG:4326 for the 2D map) ──
+    lons, lats = warp_transform(a.crs, 'EPSG:4326', list(map(float, ttx)), list(map(float, tty)))
+    features = [{
+        'type': 'Feature',
+        'geometry': {'type': 'Point', 'coordinates': [round(float(lon), 7), round(float(lat), 7)]},
+        'properties': {'tree_id': int(tid), 'height_m': round(float(h), 1)},
+    } for tid, lon, lat, h in zip(tree_ids, lons, lats, z_true)]
+    with open(geojson_file, "w") as f:
+        json.dump({'type': 'FeatureCollection', 'features': features}, f)
+    print(f"  GeoJSON ({len(features):,} pts): {geojson_file}")
 
     # ── Summary ───────────────────────────────────────────
     print("\n── Summary ──────────────────────────────────────────────")
