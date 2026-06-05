@@ -245,6 +245,34 @@ async function handleVector(file, output, siteId, type) {
            bucket: LAYERS_BUCKET, path: key, added_to_map: true }
 }
 
+// Mirror a tree/stem GeoJSON into the analyse-once feature store (PostGIS).
+// Clears the prior set for this estate+cloud+source, then batch-inserts points.
+async function ingestFeatures(table, source, geojsonPath, estateId, cloudJobId) {
+  let gj
+  try { gj = JSON.parse(await fsp.readFile(geojsonPath, 'utf8')) } catch { return 0 }
+  const feats = gj.features || []
+  await supabase.from(table).delete().eq('estate_id', estateId).eq('cloud_job_id', cloudJobId).eq('source', source)
+  const rows = []
+  for (const f of feats) {
+    const c = f.geometry && f.geometry.coordinates
+    if (!Array.isArray(c)) continue
+    const p = f.properties || {}
+    const row = {
+      estate_id: estateId, cloud_job_id: cloudJobId, source,
+      tree_id: p.tree_id != null ? Math.trunc(Number(p.tree_id)) : null,
+      height_m: typeof p.height_m === 'number' ? p.height_m : null,
+      geom: `SRID=4326;POINT(${c[0]} ${c[1]})`,
+    }
+    if (table === 'analysis_stems') row.dbh_cm = typeof p.dbh_cm === 'number' ? p.dbh_cm : null
+    rows.push(row)
+  }
+  for (let i = 0; i < rows.length; i += 2000) {
+    const { error } = await supabase.from(table).insert(rows.slice(i, i + 2000))
+    if (error) throw error
+  }
+  return rows.length
+}
+
 async function runAnalyses(cloudJobId, ids) {
   const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id').eq('id', cloudJobId).single()
   if (!job) throw new Error('cloud job not found')
@@ -267,6 +295,7 @@ async function runAnalyses(cloudJobId, ids) {
 
   await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
 
+  let featuresIngested = false
   for (let i = 0; i < chain.length; i++) {
     const a = chain[i]
     const analysisId = planIds[i]
@@ -284,7 +313,15 @@ async function runAnalyses(cloudJobId, ids) {
         const fpath = ctx.f(out.file)
         if (out.role === 'summary') { summary = JSON.parse(await fsp.readFile(fpath, 'utf8')) }
         else if (out.role === 'raster') produced.push(await handleRaster(fpath, out, job.site_id, a.id))
-        else if (out.role === 'vector') produced.push(await handleVector(fpath, out, job.site_id, a.id))
+        else if (out.role === 'vector') {
+          produced.push(await handleVector(fpath, out, job.site_id, a.id))
+          // Mirror tree/stem vectors into the feature store. Best-effort: never fails
+          // the analysis if the hierarchy schema isn't applied yet.
+          try {
+            if (out.kind === 'treetops') { await ingestFeatures('analysis_trees', 'treetops', fpath, job.site_id, cloudJobId); featuresIngested = true }
+            else if (out.kind === 'dbh') { await ingestFeatures('analysis_stems', 'dbh', fpath, job.site_id, cloudJobId); featuresIngested = true }
+          } catch (e) { console.error('feature ingest failed (non-fatal):', out.kind, String(e).slice(0, 200)) }
+        }
         else if (out.role === 'points') produced.push(await handlePoints(fpath, out, analysisId))
         else if (out.role === 'table')  produced.push(await handleTable(fpath, out, analysisId))
       }
@@ -298,6 +335,11 @@ async function runAnalyses(cloudJobId, ids) {
       }).eq('id', analysisId)
       throw e
     }
+  }
+  if (featuresIngested) {
+    // Stamp each tree/stem with the compartment that contains it (one SQL pass).
+    try { await supabase.rpc('tag_analysis_geometry', { p_estate: job.site_id }) }
+    catch (e) { console.error('tag_analysis_geometry failed (non-fatal):', String(e).slice(0, 200)) }
   }
   await fsp.rm(work, { recursive: true, force: true })
 }
