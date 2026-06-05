@@ -11,7 +11,6 @@ function clean(v) { return v ? v.trim().replace(/^['"]|['"]$/g, '').trim() : '' 
 const SUPABASE_URL = clean(process.env.SUPABASE_URL)
 const SUPABASE_SERVICE_ROLE_KEY = clean(process.env.SUPABASE_SERVICE_ROLE_KEY)
 const WORKER_SECRET = clean(process.env.WORKER_SECRET)
-
 const RAW_BUCKET = clean(process.env.RAW_BUCKET) || 'lidar-raw'
 const OCTREE_BUCKET = clean(process.env.OCTREE_BUCKET) || 'lidar-octree'
 const LAYERS_BUCKET = clean(process.env.LAYERS_BUCKET) || 'site-layers'
@@ -276,7 +275,7 @@ async function ingestFeatures(table, source, geojsonPath, estateId, cloudJobId) 
 
 async function runAnalyses(cloudJobId, ids) {
   const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id').eq('id', cloudJobId).single()
-  if (!job) throw new Error('cloud job not found')
+  if (!job) throw new Error('cloud job not found: ' + cloudJobId)
   const chain = resolveChain(ids)
 
   // ONE shared workspace: every stage reads/writes named artifacts here, so a stage
