@@ -224,13 +224,25 @@ async function runAnalyses(cloudJobId, ids) {
   const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'analyse-'))
   const ext = path.extname(job.raw_path) || '.las'
   const ctx = { dir: work, cloud: path.join(work, 'cloud' + ext), f: (name) => path.join(work, name) }
-  await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
-
+  // Insert the whole resolved plan as 'queued' up front so the portal shows the full
+  // pipeline immediately — even while the (potentially large) cloud is still downloading.
+  const planIds = []
   for (const a of chain) {
     const { data: row } = await supabase.from('lidar_analyses').insert({
-      cloud_job_id: cloudJobId, site_id: job.site_id, type: a.id, status: 'processing',
+      cloud_job_id: cloudJobId, site_id: job.site_id, type: a.id, status: 'queued',
     }).select('id').single()
-    const analysisId = row.id
+    planIds.push(row.id)
+  }
+
+  await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
+
+  for (let i = 0; i < chain.length; i++) {
+    const a = chain[i]
+    const analysisId = planIds[i]
+    // updated_at marks the processing-start time (used for the live elapsed timer).
+    await supabase.from('lidar_analyses').update({
+      status: 'processing', updated_at: new Date().toISOString(),
+    }).eq('id', analysisId)
 
     try {
       // matplotlib headless; scripts read prior artifacts straight from the shared dir
