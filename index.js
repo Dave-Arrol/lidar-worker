@@ -107,10 +107,14 @@ async function handleRaster(file, output, siteId, type) {
   let toWarp = file, comp = ['-co', 'COMPRESS=DEFLATE']
   if (info.bands.length === 1) {
     const b = info.bands[0], lo = b.computedMin, hi = b.computedMax, rng = (hi - lo) || 1
-    const stops = output.mode === 'grey'
-      ? [[lo, '0 0 0'], [hi, '255 255 255']]
-      : [[lo, '43 106 63'], [lo + 0.25 * rng, '116 164 75'], [lo + 0.5 * rng, '232 212 77'],
-         [lo + 0.75 * rng, '168 106 51'], [hi, '245 245 245']]
+    const stops =
+      output.mode === 'grey'
+        ? [[lo, '0 0 0'], [hi, '255 255 255']]
+      : output.mode === 'terrain'
+        ? [[lo, '46 110 70'], [lo + 0.30 * rng, '150 180 110'], [lo + 0.55 * rng, '224 206 144'],
+           [lo + 0.80 * rng, '150 110 75'], [hi, '240 240 240']]
+        : [[lo, '43 106 63'], [lo + 0.25 * rng, '116 164 75'], [lo + 0.5 * rng, '232 212 77'],
+           [lo + 0.75 * rng, '168 106 51'], [hi, '245 245 245']]
     const ramp = path.join(work, 'ramp.txt')
     await fsp.writeFile(ramp, 'nv 0 0 0 0\n' + stops.map(s => `${s[0]} ${s[1]} 255`).join('\n') + '\n')
     const col = path.join(work, 'col.tif')
@@ -142,6 +146,17 @@ async function handleTable(file, output, analysisId) {
   return { role: 'table', name: output.name, bucket: RESULTS_BUCKET, path: key }
 }
 
+// vector (GeoJSON, already EPSG:4326) -> register as a site_layers map overlay
+async function handleVector(file, output, siteId, type) {
+  const key = `${siteId}/lidar-${type}-${Date.now()}.geojson`
+  await uploadFile(LAYERS_BUCKET, key, file)
+  await supabase.from('site_layers').insert({
+    site_id: siteId, name: output.name || type, layer_type: output.kind || 'points',
+    storage_path: key, opacity: 1, visible: true, sort_order: 0,
+  })
+  return { role: 'vector', name: output.name || type, layer: output.kind || 'points', added_to_map: true }
+}
+
 async function runAnalyses(cloudJobId, ids) {
   const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id').eq('id', cloudJobId).single()
   if (!job) throw new Error('cloud job not found')
@@ -169,6 +184,7 @@ async function runAnalyses(cloudJobId, ids) {
         const fpath = ctx.f(out.file)
         if (out.role === 'summary') { summary = JSON.parse(await fsp.readFile(fpath, 'utf8')) }
         else if (out.role === 'raster') produced.push(await handleRaster(fpath, out, job.site_id, a.id))
+        else if (out.role === 'vector') produced.push(await handleVector(fpath, out, job.site_id, a.id))
         else if (out.role === 'points') produced.push(await handlePoints(fpath, out, analysisId))
         else if (out.role === 'table')  produced.push(await handleTable(fpath, out, analysisId))
       }
