@@ -110,7 +110,7 @@ async function handleRaster(file, output, siteId, type) {
     const stops =
       output.mode === 'grey'
         ? [[lo, '0 0 0'], [hi, '255 255 255']]
-      : output.mode === 'slope'
+      : output.mode === 'slope' || output.mode === 'density'
         ? [[lo, '38 130 76'], [lo + 0.33 * rng, '232 212 77'], [lo + 0.66 * rng, '214 130 54'], [hi, '200 50 40']]
       : output.mode === 'terrain'
         ? [[lo, '46 110 70'], [lo + 0.30 * rng, '150 180 110'], [lo + 0.55 * rng, '224 206 144'],
