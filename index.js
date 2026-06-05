@@ -126,7 +126,7 @@ async function handleRaster(file, output, siteId, type) {
   await run('gdal_translate', [merc, cog, '-of', 'COG', '-co', 'OVERVIEWS=AUTO', ...comp])
   const key = `${siteId}/lidar-${type}-${Date.now()}.tif`
   await uploadFile(LAYERS_BUCKET, key, cog)
-  await supabase.from('site_layers').insert({
+  await replaceLayer(siteId, output.name || type, {
     site_id: siteId, name: output.name || type, layer_type: output.kind || 'raster',
     storage_path: key, opacity: 1, visible: true, sort_order: 0,
   })
@@ -147,11 +147,23 @@ async function handleTable(file, output, analysisId) {
   return { role: 'table', name: output.name, bucket: RESULTS_BUCKET, path: key }
 }
 
+// Upsert a map layer by (site, name): drop any prior version (row + file) so
+// re-running an analysis replaces its layer instead of stacking duplicates.
+async function replaceLayer(siteId, name, rowToInsert) {
+  const { data: old } = await supabase.from('site_layers')
+    .select('id,storage_path').eq('site_id', siteId).eq('name', name)
+  if (old && old.length) {
+    await supabase.storage.from(LAYERS_BUCKET).remove(old.map(o => o.storage_path)).catch(() => {})
+    await supabase.from('site_layers').delete().in('id', old.map(o => o.id))
+  }
+  await supabase.from('site_layers').insert(rowToInsert)
+}
+
 // vector (GeoJSON, already EPSG:4326) -> register as a site_layers map overlay
 async function handleVector(file, output, siteId, type) {
   const key = `${siteId}/lidar-${type}-${Date.now()}.geojson`
   await uploadFile(LAYERS_BUCKET, key, file)
-  await supabase.from('site_layers').insert({
+  await replaceLayer(siteId, output.name || type, {
     site_id: siteId, name: output.name || type, layer_type: output.kind || 'points',
     storage_path: key, opacity: 1, visible: true, sort_order: 0,
   })
