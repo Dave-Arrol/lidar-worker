@@ -49,7 +49,14 @@ async function streamDownload(bucket, rawPath, dest) {
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const { data: signed, error } = await supabase.storage.from(bucket).createSignedUrl(rawPath, 3600)
-    if (error) throw error
+    if (error || !signed?.signedUrl) {
+      // Right after a very large upload the object can be briefly invisible. If it
+      // never appears, the upload was likely rejected (e.g. the bucket size limit).
+      if (attempt >= MAX_ATTEMPTS)
+        throw new Error(`raw cloud not found at ${bucket}/${rawPath} — the upload may have been rejected (check the ${bucket} bucket file-size limit). [${error?.message || 'no signed url'}]`)
+      await new Promise(r => setTimeout(r, 1500 * attempt))
+      continue
+    }
 
     const headers = offset > 0 ? { Range: `bytes=${offset}-` } : {}
     const resp = await fetch(signed.signedUrl, { headers })
