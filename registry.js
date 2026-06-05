@@ -168,6 +168,22 @@ const REGISTRY = [
       { role: 'table',  file: 'stem_profile_summary.csv', name: 'Stem profile summary' },
     ],
   },
+  {
+    id: 'tariff',
+    label: 'Tariff & volume',
+    description: 'Stand tariff number + merchantable volume (FC tariff system) from DBH, height and stem profiles.',
+    dependsOn: ['stem_profile'],
+    script: 'tariff.py',
+    args: (c) => ['--results', c.f('results.csv'),
+                  '--treetops', c.f('treetops.csv'),
+                  '--profile', c.f('stem_profile.csv'),
+                  '--out-summary', c.f('tariff_summary.json'),
+                  '--out-csv', c.f('tariff.csv')],
+    outputs: [
+      { role: 'table',   file: 'tariff.csv',          name: 'Tariff & volume' },
+      { role: 'summary', file: 'tariff_summary.json', name: 'summary' },
+    ],
+  },
 ]
 
 function publicRegistry() {
