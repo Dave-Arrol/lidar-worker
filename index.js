@@ -39,19 +39,60 @@ function run(cmd, args) {
 }
 
 async function streamDownload(bucket, rawPath, dest) {
-  const { data: signed, error } = await supabase.storage.from(bucket).createSignedUrl(rawPath, 3600)
-  if (error) throw error
-  const resp = await fetch(signed.signedUrl)
-  if (!resp.ok || !resp.body) throw new Error(`download failed: ${resp.status}`)
-  await new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(dest)
-    const reader = resp.body.getReader()
-    const pump = () => reader.read().then(({ done, value }) => {
-      if (done) { out.end(); return }
-      out.write(Buffer.from(value), (e) => e ? reject(e) : pump())
-    }).catch(reject)
-    out.on('finish', resolve); out.on('error', reject); pump()
-  })
+  // Large clouds (multi-GB) over Supabase's CDN occasionally drop the TLS
+  // connection mid-stream ("other side closed"). Retry with an HTTP Range
+  // header, resuming from the bytes already on disk rather than starting over.
+  const MAX_ATTEMPTS = 8
+  let offset = 0
+  let total = null
+  try { await fsp.rm(dest, { force: true }) } catch {}
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const { data: signed, error } = await supabase.storage.from(bucket).createSignedUrl(rawPath, 3600)
+    if (error) throw error
+
+    const headers = offset > 0 ? { Range: `bytes=${offset}-` } : {}
+    const resp = await fetch(signed.signedUrl, { headers })
+    if (!(resp.status === 200 || resp.status === 206) || !resp.body) {
+      throw new Error(`download failed: ${resp.status}`)
+    }
+    // Resolve total size from Content-Range (resume) or Content-Length (fresh).
+    if (total == null) {
+      const cr = resp.headers.get('content-range')
+      const cl = resp.headers.get('content-length')
+      if (cr && cr.includes('/')) total = parseInt(cr.split('/')[1], 10)
+      else if (cl && offset === 0) total = parseInt(cl, 10)
+    }
+    // Server ignored our Range and sent the whole file again — restart clean.
+    if (offset > 0 && resp.status === 200) { offset = 0; try { await fsp.rm(dest, { force: true }) } catch {} }
+
+    try {
+      await new Promise((resolve, reject) => {
+        const out = fs.createWriteStream(dest, { flags: offset > 0 ? 'a' : 'w' })
+        const reader = resp.body.getReader()
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) { out.end(); return }
+          out.write(Buffer.from(value), (e) => {
+            if (e) return reject(e)
+            offset += value.byteLength   // only advance once flushed, so resume aligns
+            pump()
+          })
+        }).catch(reject)
+        out.on('finish', resolve); out.on('error', reject); pump()
+      })
+      // Stream ended cleanly but short (server closed without erroring) — resume.
+      if (total != null && offset < total) {
+        if (attempt >= MAX_ATTEMPTS) throw new Error(`download incomplete: ${offset}/${total} bytes`)
+        await new Promise(r => setTimeout(r, 1000 * attempt))
+        continue
+      }
+      return
+    } catch (e) {
+      if (attempt >= MAX_ATTEMPTS) throw e
+      console.error(`download attempt ${attempt} dropped at ${offset} bytes (${e.message}); resuming...`)
+      await new Promise(r => setTimeout(r, 1000 * attempt))   // linear backoff
+    }
+  }
 }
 
 async function uploadFile(bucket, key, filePath, upsert = true) {
