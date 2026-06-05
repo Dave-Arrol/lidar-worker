@@ -61,6 +61,20 @@ const REGISTRY = [
     ],
   },
   {
+    id: 'slope',
+    label: 'Slope analysis',
+    description: 'Ground slope in degrees, derived from the DTM.',
+    dependsOn: ['normalise'],
+    script: 'slope.py',
+    args: (c) => ['--input', c.f('ground.csv'),
+                  '--out-tif', c.f('slope.tif'),
+                  '--out-summary', c.f('slope_summary.json')],
+    outputs: [
+      { role: 'raster',  file: 'slope.tif',          name: 'Slope', kind: 'slope', mode: 'slope' },
+      { role: 'summary', file: 'slope_summary.json', name: 'summary' },
+    ],
+  },
+  {
     id: 'treetops',
     label: 'Tree tops (quick)',
     description: 'Lightweight standalone tree-top detection (no segmentation).',
