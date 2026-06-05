@@ -94,6 +94,20 @@ const REGISTRY = [
     ],
   },
   {
+    id: 'density',
+    label: 'Tree density',
+    description: 'Stem density (trees/ha) on a 10 m grid, from the tree tops.',
+    dependsOn: ['treetops'],
+    script: 'tree_density.py',
+    args: (c) => ['--input', c.f('treetops_std.csv'),
+                  '--out-tif', c.f('tree_density.tif'),
+                  '--out-summary', c.f('tree_density_summary.json')],
+    outputs: [
+      { role: 'raster',  file: 'tree_density.tif',          name: 'Tree density', kind: 'density', mode: 'density' },
+      { role: 'summary', file: 'tree_density_summary.json', name: 'summary' },
+    ],
+  },
+  {
     id: 'segmentation',
     label: 'Crown segmentation',
     description: 'Watershed tree assignment + lower-stem candidate cloud.',
