@@ -15,6 +15,7 @@ const RAW_BUCKET = clean(process.env.RAW_BUCKET) || 'lidar-raw'
 const OCTREE_BUCKET = clean(process.env.OCTREE_BUCKET) || 'lidar-octree'
 const LAYERS_BUCKET = clean(process.env.LAYERS_BUCKET) || 'site-layers'
 const RESULTS_BUCKET = clean(process.env.RESULTS_BUCKET) || 'lidar-results'
+const VIEW_MAX_POINTS = parseInt(clean(process.env.VIEW_MAX_POINTS) || '30000000', 10)
 const PORT = clean(process.env.PORT) || 8080
 
 console.log('ENV -> URL:', SUPABASE_URL ? 'set' : 'MISSING', '| KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'set' : 'MISSING')
@@ -102,9 +103,19 @@ async function streamDownload(bucket, rawPath, dest) {
   }
 }
 
+const UPLOAD_MIME = {
+  '.json': 'application/json', '.geojson': 'application/geo+json',
+  '.tif': 'image/tiff', '.tiff': 'image/tiff', '.csv': 'text/csv',
+  '.bin': 'application/octet-stream', '.las': 'application/octet-stream',
+  '.laz': 'application/octet-stream', '.hrc': 'application/octet-stream',
+}
 async function uploadFile(bucket, key, filePath, upsert = true) {
-  const buf = await fsp.readFile(filePath)
-  const { error } = await supabase.storage.from(bucket).upload(key, buf, { upsert })
+  // Stream from disk via a Blob. fsp.readFile() buffers the whole file, and Node
+  // can't hold a Buffer >2 GiB — octree.bin for large clouds blows past that.
+  // openAsBlob is lazily read, and 3-4 GB stays under S3's 5 GB single-PUT limit.
+  const blob = await fs.openAsBlob(filePath)
+  const contentType = UPLOAD_MIME[path.extname(key).toLowerCase()] || 'application/octet-stream'
+  const { error } = await supabase.storage.from(bucket).upload(key, blob, { upsert, contentType })
   if (error) throw error
 }
 
@@ -126,7 +137,20 @@ async function convertJob(jobId, rawPath) {
   const inFile = path.join(work, path.basename(rawPath))
   const outDir = path.join(work, 'octree')
   await streamDownload(RAW_BUCKET, rawPath, inFile)
-  await run('/opt/potree/PotreeConverter', [inFile, '-o', outDir, '--encoding', 'BROTLI'])
+
+  // Build the octree from a thinned copy — the viewer doesn't need full density,
+  // so a smaller cloud means a far smaller/faster octree with much less RAM.
+  // Analysis is unaffected: /analyse downloads the dense cloud separately. Falls
+  // back to the dense file if thinning fails for any reason.
+  const thinFile = path.join(work, 'view.las')
+  let convertInput = inFile
+  try {
+    await run('python3', ['/app/scripts/thin_las.py', '--input', inFile, '--output', thinFile, '--max-points', String(VIEW_MAX_POINTS)])
+    convertInput = thinFile
+  } catch (e) {
+    console.error('thinning failed, converting full cloud', e)
+  }
+  await run('/opt/potree/PotreeConverter', [convertInput, '-o', outDir, '--encoding', 'BROTLI'])
   for (const f of await fsp.readdir(outDir)) await uploadFile(OCTREE_BUCKET, `${jobId}/${f}`, path.join(outDir, f))
   await supabase.from('lidar_jobs').update({ status: 'ready', octree_path: `${jobId}/metadata.json`, updated_at: new Date().toISOString() }).eq('id', jobId)
   await fsp.rm(work, { recursive: true, force: true })
