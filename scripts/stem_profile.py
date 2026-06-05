@@ -520,7 +520,7 @@ def save_summary_csv(path, summary_rows):
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    ALG_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILE_CSV.parent.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Load inputs ────────────────────────────────────
     print(f'Reading results CSV:  {RESULTS_CSV}')
@@ -660,3 +660,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
