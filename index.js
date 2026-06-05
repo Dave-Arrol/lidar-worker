@@ -130,7 +130,8 @@ async function handleRaster(file, output, siteId, type) {
     site_id: siteId, name: output.name || type, layer_type: output.kind || 'raster',
     storage_path: key, opacity: 1, visible: true, sort_order: 0,
   })
-  return { role: 'raster', name: output.name || type, layer: output.kind || 'raster', added_to_map: true }
+  return { role: 'raster', name: output.name || type, layer_type: output.kind || 'raster',
+           bucket: LAYERS_BUCKET, path: key, added_to_map: true }
 }
 
 async function handlePoints(file, output, analysisId) {
@@ -154,7 +155,8 @@ async function handleVector(file, output, siteId, type) {
     site_id: siteId, name: output.name || type, layer_type: output.kind || 'points',
     storage_path: key, opacity: 1, visible: true, sort_order: 0,
   })
-  return { role: 'vector', name: output.name || type, layer: output.kind || 'points', added_to_map: true }
+  return { role: 'vector', name: output.name || type, layer_type: output.kind || 'points',
+           bucket: LAYERS_BUCKET, path: key, added_to_map: true }
 }
 
 async function runAnalyses(cloudJobId, ids) {
