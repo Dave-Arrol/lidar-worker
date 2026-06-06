@@ -188,6 +188,8 @@ async function handleRaster(file, output, siteId, type) {
         ? [[lo, '0 0 0'], [hi, '255 255 255']]
       : output.mode === 'slope' || output.mode === 'density'
         ? [[lo, '38 130 76'], [lo + 0.33 * rng, '232 212 77'], [lo + 0.66 * rng, '214 130 54'], [hi, '200 50 40']]
+      : output.mode === 'water'
+        ? [[lo, '198 230 245'], [lo + 0.5 * rng, '66 146 198'], [hi, '8 48 107']]
       : output.mode === 'terrain'
         ? [[lo, '46 110 70'], [lo + 0.30 * rng, '150 180 110'], [lo + 0.55 * rng, '224 206 144'],
            [lo + 0.80 * rng, '150 110 75'], [hi, '240 240 240']]
