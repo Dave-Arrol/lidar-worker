@@ -299,6 +299,20 @@ async function runAnalyses(cloudJobId, ids) {
 
   await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
 
+  // Write the estate's compartment polygons into the workspace so the tariff stage can
+  // refit a tariff per compartment (point-in-polygon). Best-effort: tariff.py falls back
+  // to a single stand tariff if this file is empty or missing.
+  try {
+    const { data: comps } = await supabase.from('compartments')
+      .select('id,reference,name,boundary,area_hectares').eq('site_id', job.site_id)
+    const features = (comps || []).filter(c => c.boundary).map(c => ({
+      type: 'Feature',
+      properties: { id: c.id, ref: c.reference || c.name || String(c.id), area_hectares: c.area_hectares },
+      geometry: c.boundary,
+    }))
+    await fsp.writeFile(ctx.f('compartments.geojson'), JSON.stringify({ type: 'FeatureCollection', features }))
+  } catch (e) { console.error('compartments fetch failed (non-fatal):', String(e).slice(0, 200)) }
+
   let featuresIngested = false
   for (let i = 0; i < chain.length; i++) {
     const a = chain[i]
