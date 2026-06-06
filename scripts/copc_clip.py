@@ -122,8 +122,8 @@ def main():
                     help="Print point count / bounds / timing after the crop")
     args = ap.parse_args()
 
-    if not args.bounds and not args.polygon:
-        ap.error("provide --bounds or --polygon")
+    if not args.bounds and not args.polygon and not args.resolution:
+        ap.error("provide --bounds, --polygon, or --resolution")
 
     reader = {"type": "readers.copc", "filename": args.input}
     if args.copc_crs:

@@ -21,6 +21,10 @@ const PORT = clean(process.env.PORT) || 8080
 // COPCs back here. Credentials come from AWS_ACCESS_KEY_ID/SECRET env (or a task role).
 const S3_BUCKET = clean(process.env.S3_BUCKET) || 'arrol-lidar'
 const AWS_REGION = clean(process.env.AWS_REGION) || 'eu-west-2'
+// Density to extract from a COPC for analysis (metres). The COPC octree lets us pull a
+// coarser level of detail than full density, so we never load a 100M-point cloud whole.
+// 0.2 m ≈ a few million points for a typical drone site — ample for DTM/CHM, safe on RAM.
+const ANALYSE_RES = parseFloat(clean(process.env.ANALYSE_COPC_RESOLUTION) || '0.2')
 
 // PROJ/GDAL data paths for the conda-installed geo tools (untwine, and later pdal).
 // These binaries live on PATH but were never conda-activated, so PROJ can't locate its
@@ -360,14 +364,17 @@ async function ingestFeatures(table, source, geojsonPath, estateId, cloudJobId) 
 }
 
 async function runAnalyses(cloudJobId, ids) {
-  const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id').eq('id', cloudJobId).single()
+  const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id,copc_path,storage').eq('id', cloudJobId).single()
   if (!job) throw new Error('cloud job not found: ' + cloudJobId)
   const chain = resolveChain(ids)
 
   // ONE shared workspace: every stage reads/writes named artifacts here, so a stage
   // like DBH can consume tree_candidates.las + ground.csv + treetops.csv from earlier stages.
   const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'analyse-'))
-  const ext = path.extname(job.raw_path) || '.las'
+  // S3/COPC jobs: the cloud lives in S3 (we pull the COPC, a valid LAZ 1.4). Legacy jobs:
+  // the raw LAS streams from Supabase.
+  const isS3 = job.storage === 's3' || !!job.copc_path
+  const ext = isS3 ? '.las' : (path.extname(job.raw_path) || '.las')
   const ctx = { dir: work, cloud: path.join(work, 'cloud' + ext), f: (name) => path.join(work, name) }
   // Insert the whole resolved plan as 'queued' up front so the portal shows the full
   // pipeline immediately — even while the (potentially large) cloud is still downloading.
@@ -379,7 +386,24 @@ async function runAnalyses(cloudJobId, ids) {
     planIds.push(row.id)
   }
 
-  await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
+  // Materialise the cloud into the workspace.
+  if (isS3) {
+    // S3/COPC: download the COPC, then extract a density-reduced copy from its octree via
+    // copc_clip. This is the memory fix — a 100M-point cloud becomes a few million points
+    // at ANALYSE_RES spacing, plenty for DTM/CHM, without ever loading it whole. copc_clip
+    // shells pdal, which needs the conda PROJ env (GEO_ENV). (Per-compartment full-density
+    // clipping is the next refinement; this handles broad, whole-site analysis.)
+    const srcKey = job.copc_path || job.raw_path
+    const copcTmp = path.join(work, 'src.copc.laz')
+    console.log('[analyse] pull COPC from S3', srcKey)
+    await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${srcKey}`, copcTmp, '--no-progress', '--region', AWS_REGION])
+    console.log('[analyse] copc_clip @', ANALYSE_RES, 'm ->', ctx.cloud)
+    await run('python3', [path.join('/app/scripts', 'copc_clip.py'),
+      '--input', copcTmp, '--out', ctx.cloud, '--resolution', String(ANALYSE_RES), '--stats'],
+      { env: GEO_ENV })
+  } else {
+    await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
+  }
 
   // Write the estate's compartment polygons into the workspace so the tariff stage can
   // refit a tariff per compartment (point-in-polygon). Best-effort: tariff.py falls back

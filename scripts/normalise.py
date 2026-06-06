@@ -1,4 +1,3 @@
-
 """
 normalise.py  –  Ground-filter a clipped LAS/LAZ cloud and normalise point heights.
 
@@ -141,6 +140,11 @@ def main():
     out        = laspy.LasData(header=las.header)
     out.points = las.points
     out.z      = normalised_z
+    # The input may be a COPC (read straight from S3). laspy can't re-serialise the COPC
+    # VLRs, and the normalised output is a plain LAS, so strip them before saving.
+    out.header.vlrs[:] = [v for v in out.header.vlrs if getattr(v, "user_id", "") != "copc"]
+    if getattr(out.header, "evlrs", None):
+        out.header.evlrs[:] = [v for v in out.header.evlrs if getattr(v, "user_id", "") != "copc"]
     out.write(out_las_path)
     print(f"Normalised LAS saved: {out_las_path}")
 
