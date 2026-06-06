@@ -22,6 +22,21 @@ const PORT = clean(process.env.PORT) || 8080
 const S3_BUCKET = clean(process.env.S3_BUCKET) || 'arrol-lidar'
 const AWS_REGION = clean(process.env.AWS_REGION) || 'eu-west-2'
 
+// PROJ/GDAL data paths for the conda-installed geo tools (untwine, and later pdal).
+// These binaries live on PATH but were never conda-activated, so PROJ can't locate its
+// database and spews "Open of /opt/pdal/share/proj failed". We point ONLY these tools at
+// the conda database, scoped through the subprocess env (NOT a global var), because the
+// image carries THREE separate PROJ stacks: conda's for untwine/pdal, rasterio's bundled
+// copy for the Python analyses, and apt's for the GDAL raster steps. A global PROJ_DATA
+// would feed the wrong-version database to the other two and break them.
+const CONDA_PREFIX = clean(process.env.CONDA_PREFIX) || '/opt/pdal'
+const GEO_ENV = {
+  ...process.env,
+  PROJ_DATA: `${CONDA_PREFIX}/share/proj`,
+  PROJ_LIB:  `${CONDA_PREFIX}/share/proj`,   // older PROJ reads PROJ_LIB; harmless on PROJ 9
+  GDAL_DATA: `${CONDA_PREFIX}/share/gdal`,
+}
+
 console.log('ENV -> URL:', SUPABASE_URL ? 'set' : 'MISSING', '| KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'set' : 'MISSING', '| S3:', S3_BUCKET)
 // Guard missing Supabase config so the worker still boots — and /health + /ingest stay
 // usable — even before the app-DB env vars are wired in.
@@ -43,13 +58,23 @@ app.get('/registry', (req, res) => {
 // disk, so bump the task's ephemeral storage for clouds bigger than a few GB.
 app.post('/ingest', (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
-  const { key, outKey } = req.body || {}
+  const { key, outKey, jobId } = req.body || {}
   if (!key) return res.status(400).json({ error: 'key required — the S3 key of the uploaded .las/.laz' })
   res.status(202).json({ accepted: true, key })
-  ingestCopc(key, outKey).catch(e => console.error('[ingest] failed', key, String(e)))
+  ingestCopc(key, outKey, jobId).catch(async (e) => {
+    console.error('[ingest] failed', key, String(e))
+    // Surface the failure to the portal so the panel can show it (best-effort).
+    if (jobId && supabase) {
+      try {
+        await supabase.from('lidar_jobs')
+          .update({ status: 'failed', error: String(e).slice(0, 500), updated_at: new Date().toISOString() })
+          .eq('id', jobId)
+      } catch (_) {}
+    }
+  })
 })
 
-async function ingestCopc(key, outKeyArg) {
+async function ingestCopc(key, outKeyArg, jobId) {
   const s3 = (k) => `s3://${S3_BUCKET}/${k}`
   const region = ['--region', AWS_REGION]
   const inExt = (path.extname(key) || '.las').toLowerCase()
@@ -64,18 +89,27 @@ async function ingestCopc(key, outKeyArg) {
     console.log('[ingest] download', s3(key))
     await run('aws', ['s3', 'cp', s3(key), inFile, '--no-progress', ...region])
     console.log('[ingest] untwine -> COPC')
-    await run('untwine', ['-i', inFile, '-o', outFile, '--temp_dir', tmpDir])
+    await run('untwine', ['-i', inFile, '-o', outFile, '--temp_dir', tmpDir], { env: GEO_ENV })
     console.log('[ingest] upload', s3(outKey))
     await run('aws', ['s3', 'cp', outFile, s3(outKey), '--no-progress', ...region])
     console.log('[ingest] done ->', outKey)
+    // Mark the job COPC-ready so the portal can pick it up. Wrapped: the COPC is already
+    // safely in S3, so a DB hiccup here must not flip the job to 'failed'.
+    if (jobId && supabase) {
+      try {
+        await supabase.from('lidar_jobs')
+          .update({ copc_path: outKey, status: 'ready', updated_at: new Date().toISOString() })
+          .eq('id', jobId)
+      } catch (e2) { console.error('[ingest] row update failed (COPC is fine):', String(e2)) }
+    }
   } finally {
     await fsp.rm(work, { recursive: true, force: true }).catch(() => {})
   }
 }
 
-function run(cmd, args) {
+function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { maxBuffer: 1024 * 1024 * 64 }, (err, stdout, stderr) => {
+    execFile(cmd, args, { maxBuffer: 1024 * 1024 * 64, ...opts }, (err, stdout, stderr) => {
       if (stdout) console.log('[stdout]', stdout)
       if (stderr) console.log('[stderr]', stderr)
       err ? reject(new Error([stderr, stdout, err.message].filter(Boolean).join(' | '))) : resolve(stdout)
