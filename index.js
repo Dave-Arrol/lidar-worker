@@ -40,66 +40,70 @@ function run(cmd, args) {
 }
 
 async function streamDownload(bucket, rawPath, dest) {
-  // Large clouds (multi-GB) over Supabase's CDN occasionally drop the TLS
-  // connection mid-stream ("other side closed"). Retry with an HTTP Range
-  // header, resuming from the bytes already on disk rather than starting over.
-  const MAX_ATTEMPTS = 8
-  let offset = 0
-  let total = null
-  try { await fsp.rm(dest, { force: true }) } catch {}
+  // Multi-GB clouds over Supabase's CDN get killed at a fixed connection-duration
+  // limit (~100s), and the resume Range on a single long stream was being ignored
+  // (server replies 200 with the whole file → restart-from-zero loop, stuck forever
+  // at the same byte). Instead we pull the object in explicit fixed-size Range chunks:
+  // each request is short-lived (never hits the time limit), deterministic, and
+  // retried on its own. Chunks are written to disk in order, bounded memory.
+  const CHUNK = 256 * 1024 * 1024   // 256 MB per request
+  const MAX_RETRY = 6
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const { data: signed, error } = await supabase.storage.from(bucket).createSignedUrl(rawPath, 3600)
-    if (error || !signed?.signedUrl) {
-      // Right after a very large upload the object can be briefly invisible. If it
-      // never appears, the upload was likely rejected (e.g. the bucket size limit).
-      if (attempt >= MAX_ATTEMPTS)
-        throw new Error(`raw cloud not found at ${bucket}/${rawPath} — the upload may have been rejected (check the ${bucket} bucket file-size limit). [${error?.message || 'no signed url'}]`)
-      await new Promise(r => setTimeout(r, 1500 * attempt))
-      continue
-    }
+  const sign = async () => {
+    const { data, error } = await supabase.storage.from(bucket).createSignedUrl(rawPath, 3600)
+    if (error || !data?.signedUrl)
+      throw new Error(`raw cloud not found at ${bucket}/${rawPath} — the upload may have been rejected (check the ${bucket} bucket file-size limit). [${error?.message || 'no signed url'}]`)
+    return data.signedUrl
+  }
 
-    const headers = offset > 0 ? { Range: `bytes=${offset}-` } : {}
-    const resp = await fetch(signed.signedUrl, { headers })
-    if (!(resp.status === 200 || resp.status === 206) || !resp.body) {
-      throw new Error(`download failed: ${resp.status}`)
-    }
-    // Resolve total size from Content-Range (resume) or Content-Length (fresh).
-    if (total == null) {
-      const cr = resp.headers.get('content-range')
-      const cl = resp.headers.get('content-length')
-      if (cr && cr.includes('/')) total = parseInt(cr.split('/')[1], 10)
-      else if (cl && offset === 0) total = parseInt(cl, 10)
-    }
-    // Server ignored our Range and sent the whole file again — restart clean.
-    if (offset > 0 && resp.status === 200) { offset = 0; try { await fsp.rm(dest, { force: true }) } catch {} }
+  // Probe total size + whether the endpoint honours Range (Content-Range on a 1-byte GET).
+  let total = null, rangeOk = false
+  {
+    const r = await fetch(await sign(), { headers: { Range: 'bytes=0-0' } })
+    const cr = r.headers.get('content-range')          // "bytes 0-0/TOTAL"
+    if (cr && cr.includes('/')) { total = parseInt(cr.split('/')[1], 10); rangeOk = true }
+    else { const cl = r.headers.get('content-length'); if (cl) total = parseInt(cl, 10) }
+    try { await r.body?.cancel?.() } catch {}
+  }
+  if (!total || !Number.isFinite(total)) throw new Error(`could not determine size of ${bucket}/${rawPath}`)
 
-    try {
-      await new Promise((resolve, reject) => {
-        const out = fs.createWriteStream(dest, { flags: offset > 0 ? 'a' : 'w' })
-        const reader = resp.body.getReader()
-        const pump = () => reader.read().then(({ done, value }) => {
-          if (done) { out.end(); return }
-          out.write(Buffer.from(value), (e) => {
-            if (e) return reject(e)
-            offset += value.byteLength   // only advance once flushed, so resume aligns
-            pump()
-          })
-        }).catch(reject)
-        out.on('finish', resolve); out.on('error', reject); pump()
-      })
-      // Stream ended cleanly but short (server closed without erroring) — resume.
-      if (total != null && offset < total) {
-        if (attempt >= MAX_ATTEMPTS) throw new Error(`download incomplete: ${offset}/${total} bytes`)
-        await new Promise(r => setTimeout(r, 1000 * attempt))
-        continue
+  await fsp.rm(dest, { force: true }).catch(() => {})
+  const out = fs.createWriteStream(dest, { flags: 'w' })
+  const writeBody = async (body) => {
+    const reader = body.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!out.write(Buffer.from(value))) await new Promise(res => out.once('drain', res))  // honour backpressure
+    }
+  }
+
+  try {
+    if (!rangeOk) {
+      // No Range support — fall back to a single stream (best effort).
+      const resp = await fetch(await sign())
+      if (!resp.ok || !resp.body) throw new Error(`download failed: ${resp.status}`)
+      await writeBody(resp.body)
+    } else {
+      for (let start = 0; start < total; start += CHUNK) {
+        const end = Math.min(start + CHUNK, total) - 1
+        let okChunk = false
+        for (let attempt = 1; attempt <= MAX_RETRY && !okChunk; attempt++) {
+          try {
+            const resp = await fetch(await sign(), { headers: { Range: `bytes=${start}-${end}` } })
+            if (resp.status !== 206 || !resp.body) throw new Error(`status ${resp.status}`)
+            await writeBody(resp.body)
+            okChunk = true
+          } catch (e) {
+            if (attempt >= MAX_RETRY) throw new Error(`download chunk ${start}-${end} failed: ${e.message}`)
+            console.error(`chunk ${start}-${end} attempt ${attempt} failed (${e.message}); retrying...`)
+            await new Promise(r => setTimeout(r, 1500 * attempt))
+          }
+        }
       }
-      return
-    } catch (e) {
-      if (attempt >= MAX_ATTEMPTS) throw e
-      console.error(`download attempt ${attempt} dropped at ${offset} bytes (${e.message}); resuming...`)
-      await new Promise(r => setTimeout(r, 1000 * attempt))   // linear backoff
     }
+  } finally {
+    await new Promise((res, rej) => out.end(err => err ? rej(err) : res()))
   }
 }
 
