@@ -74,6 +74,34 @@ DEFAULT_FORM_FACTORS: Dict[str, float] = {
     "LP": 0.41, "EL": 0.40, "JL": 0.40, "HL": 0.40,
 }
 
+# Map common shapefile species spellings -> the FC codes above. Anything unrecognised
+# falls back to the conifer default, so a stray label can never break a run.
+_SPECIES_ALIASES: Dict[str, str] = {
+    "ss": "SS", "sitka": "SS", "sitka spruce": "SS",
+    "ns": "NS", "norway": "NS", "norway spruce": "NS",
+    "sp": "SP", "scots": "SP", "scots pine": "SP", "scotspine": "SP",
+    "df": "DF", "douglas": "DF", "douglas fir": "DF",
+    "lp": "LP", "lodgepole": "LP", "lodgepole pine": "LP",
+    "el": "EL", "european larch": "EL",
+    "jl": "JL", "japanese larch": "JL",
+    "hl": "HL", "hybrid larch": "HL", "larch": "JL",
+}
+
+
+def _norm_species(s: Optional[str]) -> Optional[str]:
+    """Normalise a free-text species label to an FC code, or None if unknown."""
+    if not s:
+        return None
+    raw = str(s).strip()
+    if raw.upper() in DEFAULT_FORM_FACTORS:
+        return raw.upper()
+    return _SPECIES_ALIASES.get(raw.lower())
+
+
+def _species_form_factor(s: Optional[str], default_ff: float) -> float:
+    code = _norm_species(s)
+    return DEFAULT_FORM_FACTORS[code] if code else default_ff
+
 
 def basal_area_m2(dbh_cm: float) -> float:
     return math.pi * (dbh_cm ** 2) / 40_000.0
@@ -283,6 +311,7 @@ def _load_compartments(path: Optional[str]) -> List[Dict[str, Any]]:
             "id": p.get("id"),
             "ref": p.get("ref") or (str(p.get("id")) if p.get("id") is not None else "?"),
             "area_hectares": _f(p.get("area_hectares")),
+            "species": p.get("species"),
             "geom": geom,
             "bbox": _geom_bbox(geom),
         })
@@ -394,6 +423,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         prof.setdefault(tid, []).append((z, r))
 
+    # ---- Assign every tree to a compartment up front (point-in-polygon on WGS84) ----
+    # Done before tariff derivation so a no-profile sample tree can use *its* compartment's
+    # species form factor, and so the per-compartment refit can reuse the same assignment.
+    comps = _load_compartments(args.compartments)
+    tree_comp: Dict[int, Any] = {}                 # tree_id -> compartment id (or None)
+    tree_ll: Dict[int, Tuple[float, float]] = {}   # tree_id -> (lon, lat) in WGS84
+    if comps:
+        ids = [tid for tid in population
+               if population[tid].get("x") not in (None, "") and population[tid].get("y") not in (None, "")]
+        if ids:
+            from rasterio.warp import transform as warp_transform
+            xs = [float(population[tid]["x"]) for tid in ids]
+            ys = [float(population[tid]["y"]) for tid in ids]
+            lons, lats = warp_transform(args.crs, "EPSG:4326", xs, ys)
+            for tid, lon, lat in zip(ids, lons, lats):
+                tree_ll[tid] = (lon, lat)
+                tree_comp[tid] = _assign_compartment(lon, lat, comps)
+    # Per-compartment fallback form factor from its species (else the global fallback).
+    comp_ff: Dict[Any, float] = {c["id"]: _species_form_factor(c.get("species"), fallback_ff) for c in comps}
+    comp_species: Dict[Any, Optional[str]] = {c["id"]: _norm_species(c.get("species")) for c in comps}
+
     # ---- Steps 1+2: derive tariff numbers from volume sample trees ----
     sample_tariffs: List[float] = []
     sample_t_by_tid: Dict[int, float] = {}  # tree_id -> its own tariff (for per-compartment refit)
@@ -420,7 +470,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if vol is None or vol <= 0:
             h = d.get("height_m")
             if h and h > 0:
-                vol = form_factor_volume(dbh_cm, h, fallback_ff)
+                ff = comp_ff.get(tree_comp.get(tid), fallback_ff)   # this tree's compartment species
+                vol = form_factor_volume(dbh_cm, h, ff)
                 kind = "form_factor"
         if vol and vol > 0:
             t = tariff_from_volume(vol, ba)
@@ -452,25 +503,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if model["type"] == "linear" and (model["r2"] or 0) < 0.3:
         warnings.append(f"Weak DBH~height fit (r2={model['r2']:.2f}); imputed DBHs are rough.")
 
-    # ---- Step 4b: assign trees to compartments + refit a tariff per compartment ----
+    # ---- Step 4b: refit a tariff per compartment (trees already assigned above) ----
     # Each compartment is a stand: refit its own tariff where it has enough volume-sample
     # trees, otherwise inherit the stand tariff (flagged). DBH~height imputation stays
     # stand-level (stable); only the volume-converting tariff is localised.
-    comps = _load_compartments(args.compartments)
-    tree_comp: Dict[int, Any] = {}                 # tree_id -> compartment id (or None)
-    tree_ll: Dict[int, Tuple[float, float]] = {}   # tree_id -> (lon, lat) in WGS84
-    if comps:
-        ids = [tid for tid in population
-               if population[tid].get("x") not in (None, "") and population[tid].get("y") not in (None, "")]
-        if ids:
-            from rasterio.warp import transform as warp_transform
-            xs = [float(population[tid]["x"]) for tid in ids]
-            ys = [float(population[tid]["y"]) for tid in ids]
-            lons, lats = warp_transform(args.crs, "EPSG:4326", xs, ys)
-            for tid, lon, lat in zip(ids, lons, lats):
-                tree_ll[tid] = (lon, lat)
-                tree_comp[tid] = _assign_compartment(lon, lat, comps)
-
     comp_samples: Dict[Any, List[float]] = {}
     for tid, t in sample_t_by_tid.items():
         cid = tree_comp.get(tid)
@@ -576,6 +612,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         comp_rows.append({
             "compartment_id": cid,
             "ref": c.get("ref", str(cid)),
+            "species": comp_species.get(cid) or (str(c.get("species")).strip() if c.get("species") else None),
             "tree_count": ca["n"],
             "sample_trees": n_samp,
             "tariff": round(comp_tariff.get(cid, stand_tariff), 2),
@@ -595,7 +632,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"(counted in the stand total, not in any compartment).")
 
     if args.out_compartments and comp_rows:
-        cfields = ["compartment_id", "ref", "tree_count", "sample_trees", "tariff", "tariff_rounded",
+        cfields = ["compartment_id", "ref", "species", "tree_count", "sample_trees", "tariff", "tariff_rounded",
                    "tariff_source", "confidence", "mean_dbh_cm", "mean_height_m",
                    "merch_volume_m3", "area_hectares", "volume_per_ha_m3"]
         with open(args.out_compartments, "w", newline="", encoding="utf-8") as fh:
