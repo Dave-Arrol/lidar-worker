@@ -75,6 +75,20 @@ const REGISTRY = [
     ],
   },
   {
+    id: 'drainage',
+    label: 'Drainage (streams & ditches)',
+    description: 'Stream + ditch network from the DTM via D8 flow accumulation (where water concentrates).',
+    dependsOn: ['normalise'],
+    script: 'drainage.py',
+    args: (c) => ['--input', c.f('ground.csv'),
+                  '--out-tif', c.f('drainage.tif'),
+                  '--out-summary', c.f('drainage_summary.json')],
+    outputs: [
+      { role: 'raster',  file: 'drainage.tif',          name: 'Drainage', kind: 'drainage', mode: 'water' },
+      { role: 'summary', file: 'drainage_summary.json', name: 'summary' },
+    ],
+  },
+  {
     id: 'treetops',
     label: 'Tree tops (quick)',
     description: 'Lightweight standalone tree-top detection (no segmentation).',
