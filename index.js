@@ -306,10 +306,18 @@ async function runAnalyses(cloudJobId, ids) {
   // to a single stand tariff if this file is empty or missing.
   try {
     const { data: comps } = await supabase.from('compartments')
-      .select('id,reference,name,boundary,area_hectares').eq('site_id', job.site_id)
+      .select('id,reference,name,boundary,area_hectares,attributes').eq('site_id', job.site_id)
+    const speciesOf = (attrs) => {
+      if (!attrs || typeof attrs !== 'object') return null
+      for (const k of ['Species', 'species', 'SPECIES', 'Spp', 'spp', 'Tree Species', 'tree_species']) {
+        const v = attrs[k]
+        if (v != null && String(v).trim()) return String(v).trim()
+      }
+      return null
+    }
     const features = (comps || []).filter(c => c.boundary).map(c => ({
       type: 'Feature',
-      properties: { id: c.id, ref: c.reference || c.name || String(c.id), area_hectares: c.area_hectares },
+      properties: { id: c.id, ref: c.reference || c.name || String(c.id), area_hectares: c.area_hectares, species: speciesOf(c.attributes) },
       geometry: c.boundary,
     }))
     await fsp.writeFile(ctx.f('compartments.geojson'), JSON.stringify({ type: 'FeatureCollection', features }))
