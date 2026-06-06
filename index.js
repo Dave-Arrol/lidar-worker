@@ -46,8 +46,8 @@ async function streamDownload(bucket, rawPath, dest) {
   // at the same byte). Instead we pull the object in explicit fixed-size Range chunks:
   // each request is short-lived (never hits the time limit), deterministic, and
   // retried on its own. Chunks are written to disk in order, bounded memory.
-  const CHUNK = 256 * 1024 * 1024   // 256 MB per request
-  const MAX_RETRY = 6
+  const CHUNK = 128 * 1024 * 1024   // 128 MB per request — shorter requests drop less often
+  const MAX_RETRY = 10
 
   const sign = async () => {
     const { data, error } = await supabase.storage.from(bucket).createSignedUrl(rawPath, 3600)
@@ -129,14 +129,14 @@ app.post('/process', (req, res) => {
   const { jobId, rawPath } = req.body || {}
   if (!jobId || !rawPath) return res.status(400).json({ error: 'jobId and rawPath required' })
   res.status(202).json({ accepted: true })
-  convertJob(jobId, rawPath).catch(async (e) => {
-    console.error('job failed', jobId, e)
-    await supabase.from('lidar_jobs').update({ status: 'failed', error: String(e).slice(0, 500), updated_at: new Date().toISOString() }).eq('id', jobId)
+  convertJob(jobId, rawPath).catch((e) => {
+    // Octree is the optional 3D-view artifact — log the failure but DON'T touch the
+    // cloud's status, so analysis (which uses the raw LAS) stays available regardless.
+    console.error('octree build failed', jobId, e)
   })
 })
 
 async function convertJob(jobId, rawPath) {
-  await supabase.from('lidar_jobs').update({ status: 'processing', updated_at: new Date().toISOString() }).eq('id', jobId)
   const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'lidar-'))
   const inFile = path.join(work, path.basename(rawPath))
   const outDir = path.join(work, 'octree')
@@ -156,9 +156,11 @@ async function convertJob(jobId, rawPath) {
   }
   await run('/opt/potree/PotreeConverter', [convertInput, '-o', outDir, '--encoding', 'BROTLI'])
   for (const f of await fsp.readdir(outDir)) await uploadFile(OCTREE_BUCKET, `${jobId}/${f}`, path.join(outDir, f))
-  await supabase.from('lidar_jobs').update({ status: 'ready', octree_path: `${jobId}/metadata.json`, updated_at: new Date().toISOString() }).eq('id', jobId)
+  // Octree-only: set the viewer pointer. Status is owned by upload (ready) / analysis,
+  // never by the octree build, so a viewing failure can't block analysis.
+  await supabase.from('lidar_jobs').update({ octree_path: `${jobId}/metadata.json`, updated_at: new Date().toISOString() }).eq('id', jobId)
   await fsp.rm(work, { recursive: true, force: true })
-  console.log('job ready', jobId)
+  console.log('octree ready', jobId)
 }
 
 // ---- analysis framework ----
