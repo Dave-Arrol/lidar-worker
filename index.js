@@ -17,9 +17,17 @@ const LAYERS_BUCKET = clean(process.env.LAYERS_BUCKET) || 'site-layers'
 const RESULTS_BUCKET = clean(process.env.RESULTS_BUCKET) || 'lidar-results'
 const VIEW_MAX_POINTS = parseInt(clean(process.env.VIEW_MAX_POINTS) || '30000000', 10)
 const PORT = clean(process.env.PORT) || 8080
+// S3 (AWS) — the heavy-data lane: the worker reads uploaded clouds from here and writes
+// COPCs back here. Credentials come from AWS_ACCESS_KEY_ID/SECRET env (or a task role).
+const S3_BUCKET = clean(process.env.S3_BUCKET) || 'arrol-lidar'
+const AWS_REGION = clean(process.env.AWS_REGION) || 'eu-west-2'
 
-console.log('ENV -> URL:', SUPABASE_URL ? 'set' : 'MISSING', '| KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'set' : 'MISSING')
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+console.log('ENV -> URL:', SUPABASE_URL ? 'set' : 'MISSING', '| KEY:', SUPABASE_SERVICE_ROLE_KEY ? 'set' : 'MISSING', '| S3:', S3_BUCKET)
+// Guard missing Supabase config so the worker still boots — and /health + /ingest stay
+// usable — even before the app-DB env vars are wired in.
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null
 const app = express()
 app.use(express.json())
 
@@ -28,6 +36,42 @@ app.get('/registry', (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
   res.json(publicRegistry())
 })
+
+// ---- cloud ingest: uploaded .las/.laz in S3 -> COPC in S3 ----
+// The "user uploads, cloud handles it" path. untwine reads both LAS and LAZ and is
+// out-of-core (low RAM), but it needs scratch + the COPC output on the task's ephemeral
+// disk, so bump the task's ephemeral storage for clouds bigger than a few GB.
+app.post('/ingest', (req, res) => {
+  if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
+  const { key, outKey } = req.body || {}
+  if (!key) return res.status(400).json({ error: 'key required — the S3 key of the uploaded .las/.laz' })
+  res.status(202).json({ accepted: true, key })
+  ingestCopc(key, outKey).catch(e => console.error('[ingest] failed', key, String(e)))
+})
+
+async function ingestCopc(key, outKeyArg) {
+  const s3 = (k) => `s3://${S3_BUCKET}/${k}`
+  const region = ['--region', AWS_REGION]
+  const inExt = (path.extname(key) || '.las').toLowerCase()
+  const base = path.basename(key).replace(/\.(la[sz])$/i, '')
+  const outKey = outKeyArg || `copc/${base}.copc.laz`
+
+  const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'ingest-'))
+  const inFile = path.join(work, 'in' + inExt)
+  const outFile = path.join(work, 'out.copc.laz')
+  const tmpDir = path.join(work, 'untwine_tmp')
+  try {
+    console.log('[ingest] download', s3(key))
+    await run('aws', ['s3', 'cp', s3(key), inFile, '--no-progress', ...region])
+    console.log('[ingest] untwine -> COPC')
+    await run('untwine', ['-i', inFile, '-o', outFile, '--temp_dir', tmpDir])
+    console.log('[ingest] upload', s3(outKey))
+    await run('aws', ['s3', 'cp', outFile, s3(outKey), '--no-progress', ...region])
+    console.log('[ingest] done ->', outKey)
+  } finally {
+    await fsp.rm(work, { recursive: true, force: true }).catch(() => {})
+  }
+}
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {

@@ -16,15 +16,14 @@ RUN apt-get update && apt-get install -y \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# PDAL with COPC support.
-# Ubuntu 22.04's apt PDAL (~2.0) predates the COPC reader (added in PDAL 2.4),
-# so install a current PDAL from conda-forge via micromamba into an isolated
-# prefix and append it to PATH. copc_clip.py shells out to the `pdal` CLI;
-# PDAL's own HTTP/S3 support handles range-reads of remote COPC files.
+# PDAL (COPC reader/writer), untwine (out-of-core LAS/LAZ -> COPC builder), and the AWS
+# CLI (S3 transfers), all from conda-forge via micromamba into an isolated prefix on PATH.
+# Ubuntu 22.04's apt PDAL (~2.0) predates the COPC reader (added in PDAL 2.4); copc_clip.py
+# shells out to `pdal`, and the /ingest path shells out to `aws` and `untwine`.
 RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
         | tar -xvj -C /usr/local bin/micromamba
 ENV MAMBA_ROOT_PREFIX=/opt/conda
-RUN /usr/local/bin/micromamba create -y -p /opt/pdal -c conda-forge pdal \
+RUN /usr/local/bin/micromamba create -y -p /opt/pdal -c conda-forge pdal untwine awscli \
     && /usr/local/bin/micromamba clean -a -y
 ENV PATH=$PATH:/opt/pdal/bin
 
