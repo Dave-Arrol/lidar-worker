@@ -200,6 +200,106 @@ def _predict_dbh(model: Dict[str, Any], height_m: Optional[float]) -> Optional[f
 
 
 # ---------------------------------------------------------------------------
+# Compartment assignment (point-in-polygon) + robust tariff
+# ---------------------------------------------------------------------------
+def _robust_mean_tariff(tariffs: Sequence[float], no_reject: bool, outlier_sd: float) -> Tuple[float, int]:
+    """Mean tariff after rejecting outliers beyond `outlier_sd` SDs. Returns (mean, n_dropped)."""
+    kept = list(tariffs)
+    dropped = 0
+    if not no_reject and len(tariffs) >= 4:
+        m = statistics.fmean(tariffs)
+        sd = statistics.pstdev(tariffs)
+        if sd > 0:
+            k = [x for x in tariffs if abs(x - m) <= outlier_sd * sd]
+            if k:
+                dropped = len(tariffs) - len(k)
+                kept = k
+    return statistics.fmean(kept), dropped
+
+
+def _ring_contains(x: float, y: float, ring: Sequence[Sequence[float]]) -> bool:
+    """Ray-casting point-in-ring (ring = list of [lon, lat])."""
+    inside = False
+    n = len(ring)
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _geom_contains(x: float, y: float, geom: Dict[str, Any]) -> bool:
+    """Point-in-Polygon / MultiPolygon, honouring holes."""
+    t = geom.get("type")
+    if t == "Polygon":
+        rings = geom.get("coordinates") or []
+        if not rings or not _ring_contains(x, y, rings[0]):
+            return False
+        return not any(_ring_contains(x, y, h) for h in rings[1:])
+    if t == "MultiPolygon":
+        for poly in geom.get("coordinates") or []:
+            if poly and _ring_contains(x, y, poly[0]) and not any(_ring_contains(x, y, h) for h in poly[1:]):
+                return True
+        return False
+    return False
+
+
+def _geom_bbox(geom: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    xs: List[float] = []
+    ys: List[float] = []
+
+    def walk(co: Any) -> None:
+        if isinstance(co, (list, tuple)):
+            if co and isinstance(co[0], (int, float)):
+                xs.append(co[0]); ys.append(co[1])
+            else:
+                for c in co:
+                    walk(c)
+
+    walk(geom.get("coordinates"))
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _load_compartments(path: Optional[str]) -> List[Dict[str, Any]]:
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            gj = json.load(fh)
+    except Exception:
+        return []
+    comps: List[Dict[str, Any]] = []
+    for f in gj.get("features", []):
+        geom = f.get("geometry")
+        if not geom:
+            continue
+        p = f.get("properties") or {}
+        comps.append({
+            "id": p.get("id"),
+            "ref": p.get("ref") or (str(p.get("id")) if p.get("id") is not None else "?"),
+            "area_hectares": _f(p.get("area_hectares")),
+            "geom": geom,
+            "bbox": _geom_bbox(geom),
+        })
+    return comps
+
+
+def _assign_compartment(lon: float, lat: float, comps: List[Dict[str, Any]]) -> Optional[Any]:
+    for c in comps:
+        bb = c["bbox"]
+        if bb and (lon < bb[0] or lon > bb[2] or lat < bb[1] or lat > bb[3]):
+            continue
+        if _geom_contains(lon, lat, c["geom"]):
+            return c["id"]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -209,6 +309,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--profile",  required=False, default=None, help="Stem-profile CSV (radius at height).")
     ap.add_argument("--out-summary", required=True, help="Output headline summary JSON.")
     ap.add_argument("--out-csv",     required=True, help="Output per-tree tariff/volume CSV.")
+    ap.add_argument("--out-geojson", default=None,
+                    help="Optional per-tree merch-volume GeoJSON (points, WGS84) for the map / compartment rollup.")
+    ap.add_argument("--crs", default="EPSG:27700", help="CRS of the input x/y (reprojected to EPSG:4326 for the GeoJSON).")
+    ap.add_argument("--compartments", default=None,
+                    help="Optional compartments GeoJSON (WGS84) — refit a tariff number per compartment.")
+    ap.add_argument("--out-compartments", default=None,
+                    help="Optional per-compartment tariff/volume CSV.")
+    ap.add_argument("--min-compartment-samples", type=int, default=4,
+                    help="Min volume-sample trees in a compartment to refit its own tariff (else inherit stand).")
     ap.add_argument("--species", default=None, help="Species code for fallback form factor (e.g. SS, DF).")
     ap.add_argument("--form-factor", type=float, default=None, help="Override fallback form factor.")
     ap.add_argument("--min-confidence", type=float, default=0.40,
@@ -287,6 +396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # ---- Steps 1+2: derive tariff numbers from volume sample trees ----
     sample_tariffs: List[float] = []
+    sample_t_by_tid: Dict[int, float] = {}  # tree_id -> its own tariff (for per-compartment refit)
     sample_kind: Dict[int, str] = {}        # tree_id -> "profile" | "form_factor"
     sample_vol: Dict[int, float] = {}
     for tid, d in dbh.items():
@@ -316,6 +426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             t = tariff_from_volume(vol, ba)
             if t is not None and not math.isnan(t) and t > 0:
                 sample_tariffs.append(t)
+                sample_t_by_tid[tid] = t
                 sample_kind[tid] = kind
                 sample_vol[tid] = vol
 
@@ -323,19 +434,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("tariff.py: no volume sample trees "
                          "(need a DBH plus a stem profile or a height).")
 
-    # ---- Step 3: stand tariff = robust mean ----
-    kept = sample_tariffs
-    if not args.no_reject and len(sample_tariffs) >= 4:
-        m = statistics.fmean(sample_tariffs)
-        sd = statistics.pstdev(sample_tariffs)
-        if sd > 0:
-            kept = [x for x in sample_tariffs if abs(x - m) <= args.outlier_sd * sd]
-            dropped = len(sample_tariffs) - len(kept)
-            if dropped:
-                warnings.append(f"{dropped} sample tree(s) rejected as tariff outliers.")
-            if not kept:
-                kept = sample_tariffs
-    stand_tariff = statistics.fmean(kept)
+    # ---- Step 3: stand tariff = robust mean (fallback / inherited by sparse compartments) ----
+    stand_tariff, dropped = _robust_mean_tariff(sample_tariffs, args.no_reject, args.outlier_sd)
+    if dropped:
+        warnings.append(f"{dropped} sample tree(s) rejected as tariff outliers.")
 
     n_profile = sum(1 for k in sample_kind.values() if k == "profile")
     n_ff = sum(1 for k in sample_kind.values() if k == "form_factor")
@@ -350,8 +452,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if model["type"] == "linear" and (model["r2"] or 0) < 0.3:
         warnings.append(f"Weak DBH~height fit (r2={model['r2']:.2f}); imputed DBHs are rough.")
 
+    # ---- Step 4b: assign trees to compartments + refit a tariff per compartment ----
+    # Each compartment is a stand: refit its own tariff where it has enough volume-sample
+    # trees, otherwise inherit the stand tariff (flagged). DBH~height imputation stays
+    # stand-level (stable); only the volume-converting tariff is localised.
+    comps = _load_compartments(args.compartments)
+    tree_comp: Dict[int, Any] = {}                 # tree_id -> compartment id (or None)
+    tree_ll: Dict[int, Tuple[float, float]] = {}   # tree_id -> (lon, lat) in WGS84
+    if comps:
+        ids = [tid for tid in population
+               if population[tid].get("x") not in (None, "") and population[tid].get("y") not in (None, "")]
+        if ids:
+            from rasterio.warp import transform as warp_transform
+            xs = [float(population[tid]["x"]) for tid in ids]
+            ys = [float(population[tid]["y"]) for tid in ids]
+            lons, lats = warp_transform(args.crs, "EPSG:4326", xs, ys)
+            for tid, lon, lat in zip(ids, lons, lats):
+                tree_ll[tid] = (lon, lat)
+                tree_comp[tid] = _assign_compartment(lon, lat, comps)
+
+    comp_samples: Dict[Any, List[float]] = {}
+    for tid, t in sample_t_by_tid.items():
+        cid = tree_comp.get(tid)
+        if cid is not None:
+            comp_samples.setdefault(cid, []).append(t)
+    comp_tariff: Dict[Any, float] = {}
+    comp_tariff_source: Dict[Any, str] = {}
+    for c in comps:
+        cid = c["id"]
+        s = comp_samples.get(cid, [])
+        if len(s) >= args.min_compartment_samples:
+            comp_tariff[cid], _drop = _robust_mean_tariff(s, args.no_reject, args.outlier_sd)
+            comp_tariff_source[cid] = "refit"
+        else:
+            comp_tariff[cid] = stand_tariff
+            comp_tariff_source[cid] = "stand"
+
     # ---- Step 5: apply tariff to every tree -> per-tree volume + total ----
     rows: List[Dict[str, Any]] = []
+    comp_agg: Dict[Any, Dict[str, Any]] = {}
     total_vol = 0.0
     n_measured = n_imputed = n_no_metrics = 0
     measured_dbhs: List[float] = []
@@ -378,9 +517,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dbh_source = "stand_mean"
             n_no_metrics += 1
 
+        cid = tree_comp.get(tid)
+        applied_tariff = comp_tariff.get(cid, stand_tariff)
         ba = basal_area_m2(dbh_cm) if dbh_cm and dbh_cm > 0 else 0.0
-        vol = max(0.0, volume_from_tariff(stand_tariff, ba))
+        vol = max(0.0, volume_from_tariff(applied_tariff, ba))
         total_vol += vol
+
+        if cid is not None:
+            ca = comp_agg.setdefault(cid, {"n": 0, "vol": 0.0, "dbhs": [], "heights": []})
+            ca["n"] += 1
+            ca["vol"] += vol
+            if dbh_source == "measured" and dbh_cm:
+                ca["dbhs"].append(dbh_cm)
+            if h and h > 0:
+                ca["heights"].append(h)
 
         rows.append({
             "tree_id": tid,
@@ -390,6 +540,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "dbh_cm": round(dbh_cm, 1) if dbh_cm else "",
             "dbh_source": dbh_source,
             "basal_area_m2": round(ba, 5),
+            "compartment_id": cid if cid is not None else "",
+            "tariff_applied": round(applied_tariff, 2),
             "is_sample_tree": tid in sample_kind,
             "sample_volume_m3": round(sample_vol[tid], 4) if tid in sample_vol else "",
             "merch_volume_m3": round(vol, 4),
@@ -405,12 +557,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   "medium" if len(sample_tariffs) >= 4 else "low")
 
     # ---- write per-tree CSV (table role) ----
-    csv_fields = ["tree_id", "x", "y", "height_m", "dbh_cm", "dbh_source",
-                  "basal_area_m2", "is_sample_tree", "sample_volume_m3", "merch_volume_m3"]
+    csv_fields = ["tree_id", "x", "y", "height_m", "dbh_cm", "dbh_source", "basal_area_m2",
+                  "compartment_id", "tariff_applied", "is_sample_tree", "sample_volume_m3", "merch_volume_m3"]
     with open(args.out_csv, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=csv_fields)
         w.writeheader()
         w.writerows(rows)
+
+    # ---- per-compartment tariff + volume (the stand split into its constituent stands) ----
+    comp_rows: List[Dict[str, Any]] = []
+    by_id = {c["id"]: c for c in comps}
+    for cid in sorted(comp_agg, key=lambda v: str(v)):
+        ca = comp_agg[cid]
+        c = by_id.get(cid, {})
+        n_samp = len(comp_samples.get(cid, []))
+        area = c.get("area_hectares")
+        c_conf = ("high" if n_samp >= 13 else "medium" if n_samp >= args.min_compartment_samples else "inherited")
+        comp_rows.append({
+            "compartment_id": cid,
+            "ref": c.get("ref", str(cid)),
+            "tree_count": ca["n"],
+            "sample_trees": n_samp,
+            "tariff": round(comp_tariff.get(cid, stand_tariff), 2),
+            "tariff_rounded": int(round(comp_tariff.get(cid, stand_tariff))),
+            "tariff_source": comp_tariff_source.get(cid, "stand"),
+            "confidence": c_conf,
+            "mean_dbh_cm": round(statistics.fmean(ca["dbhs"]), 1) if ca["dbhs"] else None,
+            "mean_height_m": round(statistics.fmean(ca["heights"]), 1) if ca["heights"] else None,
+            "merch_volume_m3": round(ca["vol"], 2),
+            "area_hectares": round(area, 3) if area else None,
+            "volume_per_ha_m3": round(ca["vol"] / area, 1) if area and area > 0 else None,
+        })
+
+    n_unassigned = sum(1 for tid in population if tree_comp.get(tid) is None) if comps else 0
+    if comps and n_unassigned:
+        warnings.append(f"{n_unassigned} tree(s) fell outside every compartment boundary "
+                        f"(counted in the stand total, not in any compartment).")
+
+    if args.out_compartments and comp_rows:
+        cfields = ["compartment_id", "ref", "tree_count", "sample_trees", "tariff", "tariff_rounded",
+                   "tariff_source", "confidence", "mean_dbh_cm", "mean_height_m",
+                   "merch_volume_m3", "area_hectares", "volume_per_ha_m3"]
+        with open(args.out_compartments, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=cfields)
+            w.writeheader()
+            w.writerows(comp_rows)
 
     # ---- write headline summary JSON (summary role -> stat cards) ----
     summary = {
@@ -431,12 +622,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "total_merch_volume_m3": round(total_vol, 2),
         "mean_volume_per_tree_m3": round(total_vol / n_total, 4) if n_total else None,
         "dbh_height_r2": round(model["r2"], 3) if model.get("r2") is not None else None,
+        "compartments_summarised": len(comp_rows),
+        "compartments_refit": sum(1 for r in comp_rows if r["tariff_source"] == "refit"),
+        "compartments": comp_rows,
         "method": "UK Forestry Commission tariff system (Booklet 36/39), merch volume to 7 cm top",
         "disclaimer": "Field estimate only. Not a formal certified mensuration result.",
         "warnings": warnings,
     }
     with open(args.out_summary, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
+
+    # ---- optional: per-tree merch-volume points (WGS84) for the map + per-compartment rollup ----
+    if args.out_geojson:
+        pts = [r for r in rows if r.get("x") not in (None, "") and r.get("y") not in (None, "")]
+        feats = []
+        if pts:
+            need = [r for r in pts if r["tree_id"] not in tree_ll]
+            if need:
+                from rasterio.warp import transform as warp_transform
+                nx = [float(r["x"]) for r in need]
+                ny = [float(r["y"]) for r in need]
+                nlon, nlat = warp_transform(args.crs, "EPSG:4326", nx, ny)
+                for r, lo, la in zip(need, nlon, nlat):
+                    tree_ll[r["tree_id"]] = (lo, la)
+            for r in pts:
+                lon, lat = tree_ll[r["tree_id"]]
+                cid = tree_comp.get(r["tree_id"])
+                feats.append({
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                    "properties": {
+                        "tree_id": r["tree_id"],
+                        "merch_volume_m3": r["merch_volume_m3"],
+                        "dbh_cm": r["dbh_cm"],
+                        "height_m": r["height_m"],
+                        "dbh_source": r["dbh_source"],
+                        "compartment_id": cid if cid is not None else "",
+                        "is_sample_tree": r["is_sample_tree"],
+                    },
+                })
+        with open(args.out_geojson, "w", encoding="utf-8") as fh:
+            json.dump({"type": "FeatureCollection", "features": feats}, fh)
 
     print(f"tariff.py: stand tariff {summary['stand_tariff_rounded']} "
           f"({summary['stand_tariff']}), {n_total} trees, "
