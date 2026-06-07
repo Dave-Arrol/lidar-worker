@@ -385,6 +385,26 @@ async function ingestFeatures(table, source, geojsonPath, estateId, cloudJobId) 
   return rows.length
 }
 
+// Tariff produces a per-tree merchantable volume (keyed by tree_id). Attach it to the
+// trees already ingested from treetops, matched by tree_id, via one set-based RPC.
+async function ingestTreeVolumes(geojsonPath, estateId, cloudJobId) {
+  let gj
+  try { gj = JSON.parse(await fsp.readFile(geojsonPath, 'utf8')) } catch { return 0 }
+  const vols = []
+  for (const f of (gj.features || [])) {
+    const p = f.properties || {}
+    const t = p.tree_id != null ? Math.trunc(Number(p.tree_id)) : null
+    const v = typeof p.merch_volume_m3 === 'number' ? p.merch_volume_m3 : null
+    if (t != null && v != null) vols.push({ t, v })
+  }
+  if (!vols.length) return 0
+  const { data, error } = await supabase.rpc('set_tree_volumes', {
+    p_estate: estateId, p_cloud_job: cloudJobId, p_vols: vols,
+  })
+  if (error) throw error
+  return typeof data === 'number' ? data : vols.length
+}
+
 async function runAnalyses(cloudJobId, ids) {
   const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id,copc_path,storage').eq('id', cloudJobId).single()
   if (!job) throw new Error('cloud job not found: ' + cloudJobId)
@@ -482,6 +502,7 @@ async function runAnalyses(cloudJobId, ids) {
           try {
             if (out.kind === 'treetops') { await ingestFeatures('analysis_trees', 'treetops', fpath, job.site_id, cloudJobId); featuresIngested = true }
             else if (out.kind === 'dbh') { await ingestFeatures('analysis_stems', 'dbh', fpath, job.site_id, cloudJobId); featuresIngested = true }
+            else if (out.kind === 'volume') { await ingestTreeVolumes(fpath, job.site_id, cloudJobId) }
           } catch (e) { console.error('feature ingest failed (non-fatal):', out.kind, errMsg(e).slice(0, 300)) }
         }
         else if (out.role === 'points') {
