@@ -46,6 +46,19 @@ def _pdal_info_summary(path):
         return None
 
 
+def _pdal_scale(path):
+    # The coordinate scale = the grid the points are quantised to. DBH ring-fitting
+    # needs this fine (mm), so we print it to confirm the extract didn't coarsen it.
+    r = _run(["pdal", "info", "--metadata", path])
+    if r.returncode != 0:
+        return None
+    try:
+        m = json.loads(r.stdout).get("metadata", {})
+        return (m.get("scale_x"), m.get("scale_y"), m.get("scale_z"))
+    except Exception:
+        return None
+
+
 def _bounds_to_pdal(minx, miny, maxx, maxy):
     # PDAL bounds string form: ([minx, maxx], [miny, maxy])
     return "([{}, {}], [{}, {}])".format(minx, maxx, miny, maxy)
@@ -122,8 +135,9 @@ def main():
                     help="Print point count / bounds / timing after the crop")
     args = ap.parse_args()
 
-    if not args.bounds and not args.polygon and not args.resolution:
-        ap.error("provide --bounds, --polygon, or --resolution")
+    # No crop and no resolution = full-density extract of the entire COPC to LAS.
+    # That's the default analysis path now (DBH/stem profiles need full density);
+    # --bounds / --polygon / --resolution are optional refinements on top.
 
     reader = {"type": "readers.copc", "filename": args.input}
     if args.copc_crs:
@@ -146,8 +160,11 @@ def main():
 
     ext = os.path.splitext(args.out)[1].lower()
     if ext in (".laz", ".las"):
+        # forward scale,offset: keep the COPC's coordinate precision instead of
+        # pdal's default 1cm scale, which would blur stems and break DBH ring-fitting.
         writer = {"type": "writers.las", "filename": args.out,
-                  "compression": (ext == ".laz")}
+                  "compression": (ext == ".laz"),
+                  "forward": "scale,offset"}
     elif ext == ".csv":
         writer = {"type": "writers.text", "format": "csv",
                   "order": "X,Y,Z", "keep_unspecified": "true",
@@ -183,6 +200,9 @@ def main():
         print("OK  {:.1f}s".format(dt))
         print("    points : {}".format(n if n is not None else "?"))
         print("    output : {}  ({:.1f} MB)".format(args.out, sz / 1e6))
+        sc = _pdal_scale(args.out)
+        if sc and sc[0] is not None:
+            print("    scale  : x={} y={} z={}".format(*sc))
         if bnds:
             print("    bounds : {}".format(bnds))
 

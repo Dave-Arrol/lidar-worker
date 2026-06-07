@@ -24,7 +24,7 @@ const AWS_REGION = clean(process.env.AWS_REGION) || 'eu-west-2'
 // Density to extract from a COPC for analysis (metres). The COPC octree lets us pull a
 // coarser level of detail than full density, so we never load a 100M-point cloud whole.
 // 0.2 m ≈ a few million points for a typical drone site — ample for DTM/CHM, safe on RAM.
-const ANALYSE_RES = parseFloat(clean(process.env.ANALYSE_COPC_RESOLUTION) || '0.2')
+const ANALYSE_RES = clean(process.env.ANALYSE_COPC_RESOLUTION) || ''  // empty = full density (no reduction); set only to rescue a huge cloud
 
 // PROJ/GDAL data paths for the conda-installed geo tools (untwine, and later pdal).
 // These binaries live on PATH but were never conda-activated, so PROJ can't locate its
@@ -195,14 +195,36 @@ const UPLOAD_MIME = {
   '.bin': 'application/octet-stream', '.las': 'application/octet-stream',
   '.laz': 'application/octet-stream', '.hrc': 'application/octet-stream',
 }
+// Turn any thrown value (incl. opaque Supabase/Postgres error objects, which
+// stringify to "[object Object]") into something legible for logs.
+function errMsg(e) {
+  if (!e) return 'unknown'
+  if (typeof e === 'string') return e
+  if (e.message) return String(e.message)
+  if (e.code || e.details || e.hint) return [e.code, e.details, e.hint].filter(Boolean).join(' | ')
+  try { return JSON.stringify(e) } catch { return String(e) }
+}
+
 async function uploadFile(bucket, key, filePath, upsert = true) {
   // Stream from disk via a Blob. fsp.readFile() buffers the whole file, and Node
   // can't hold a Buffer >2 GiB — octree.bin for large clouds blows past that.
   // openAsBlob is lazily read, and 3-4 GB stays under S3's 5 GB single-PUT limit.
-  const blob = await fs.openAsBlob(filePath)
   const contentType = UPLOAD_MIME[path.extname(key).toLowerCase()] || 'application/octet-stream'
-  const { error } = await supabase.storage.from(bucket).upload(key, blob, { upsert, contentType })
-  if (error) throw error
+  // Supabase storage's gateway intermittently 502s on otherwise-fine uploads.
+  // A 5xx/429 is transient, so retry with backoff before giving up. (Genuine
+  // size-limit failures on huge clouds still need the S3 output lane — separate.)
+  const attempts = 4
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const blob = await fs.openAsBlob(filePath)   // re-open per try; a Blob is re-readable but this is safest
+    const { error } = await supabase.storage.from(bucket).upload(key, blob, { upsert, contentType })
+    if (!error) return
+    const status = Number(error.statusCode || error.status || 0)
+    const retryable = status === 0 || status === 429 || (status >= 500 && status <= 599)
+    if (attempt === attempts || !retryable) throw error
+    const backoff = Math.min(8000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 300)
+    console.warn(`upload ${key} failed (status ${status}), retry ${attempt}/${attempts - 1} in ${backoff}ms: ${errMsg(error)}`)
+    await new Promise(r => setTimeout(r, backoff))
+  }
 }
 
 // ---- existing octree conversion (unchanged behaviour) ----
@@ -388,19 +410,27 @@ async function runAnalyses(cloudJobId, ids) {
 
   // Materialise the cloud into the workspace.
   if (isS3) {
-    // S3/COPC: download the COPC, then extract a density-reduced copy from its octree via
-    // copc_clip. This is the memory fix — a 100M-point cloud becomes a few million points
-    // at ANALYSE_RES spacing, plenty for DTM/CHM, without ever loading it whole. copc_clip
-    // shells pdal, which needs the conda PROJ env (GEO_ENV). (Per-compartment full-density
-    // clipping is the next refinement; this handles broad, whole-site analysis.)
-    const srcKey = job.copc_path || job.raw_path
-    const copcTmp = path.join(work, 'src.copc.laz')
-    console.log('[analyse] pull COPC from S3', srcKey)
-    await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${srcKey}`, copcTmp, '--no-progress', '--region', AWS_REGION])
-    console.log('[analyse] copc_clip @', ANALYSE_RES, 'm ->', ctx.cloud)
-    await run('python3', [path.join('/app/scripts', 'copc_clip.py'),
-      '--input', copcTmp, '--out', ctx.cloud, '--resolution', String(ANALYSE_RES), '--stats'],
-      { env: GEO_ENV })
+    // Analyse the ORIGINAL uploaded LAS at full fidelity — the same bytes the Railway
+    // pipeline used, and what the legacy path below still does. The COPC is a viewing/
+    // subsetting derivative; routing analysis through copc_clip was re-quantising and
+    // thinning the cloud, which starves DBH ring-fitting. So source the raw upload.
+    // Fall back to clipping the COPC only when there's no raw LAS available, or when
+    // ANALYSE_COPC_RESOLUTION is set to rescue a cloud too big to load whole.
+    const rawKey = job.raw_path
+    const rawIsCopc = !!rawKey && /\.copc\./i.test(rawKey)
+    const useRaw = !!rawKey && !rawIsCopc && !ANALYSE_RES
+    if (useRaw) {
+      console.log('[analyse] source: original LAS (full fidelity)', rawKey)
+      await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${rawKey}`, ctx.cloud, '--no-progress', '--region', AWS_REGION])
+    } else {
+      const srcKey = job.copc_path || job.raw_path
+      const copcTmp = path.join(work, 'src.copc.laz')
+      console.log('[analyse] source: COPC extract', srcKey, ANALYSE_RES ? `@ ${ANALYSE_RES} m` : '(full density)')
+      await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${srcKey}`, copcTmp, '--no-progress', '--region', AWS_REGION])
+      const clipArgs = ['--input', copcTmp, '--out', ctx.cloud, '--stats']
+      if (ANALYSE_RES) clipArgs.push('--resolution', String(ANALYSE_RES))
+      await run('python3', [path.join('/app/scripts', 'copc_clip.py'), ...clipArgs], { env: GEO_ENV })
+    }
   } else {
     await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
   }
@@ -425,7 +455,7 @@ async function runAnalyses(cloudJobId, ids) {
       geometry: c.boundary,
     }))
     await fsp.writeFile(ctx.f('compartments.geojson'), JSON.stringify({ type: 'FeatureCollection', features }))
-  } catch (e) { console.error('compartments fetch failed (non-fatal):', String(e).slice(0, 200)) }
+  } catch (e) { console.error('compartments fetch failed (non-fatal):', errMsg(e).slice(0, 300)) }
 
   let featuresIngested = false
   for (let i = 0; i < chain.length; i++) {
@@ -452,9 +482,16 @@ async function runAnalyses(cloudJobId, ids) {
           try {
             if (out.kind === 'treetops') { await ingestFeatures('analysis_trees', 'treetops', fpath, job.site_id, cloudJobId); featuresIngested = true }
             else if (out.kind === 'dbh') { await ingestFeatures('analysis_stems', 'dbh', fpath, job.site_id, cloudJobId); featuresIngested = true }
-          } catch (e) { console.error('feature ingest failed (non-fatal):', out.kind, String(e).slice(0, 200)) }
+          } catch (e) { console.error('feature ingest failed (non-fatal):', out.kind, errMsg(e).slice(0, 300)) }
         }
-        else if (out.role === 'points') produced.push(await handlePoints(fpath, out, analysisId))
+        else if (out.role === 'points') {
+          // Octree is only for the optional 3D viewer. PotreeConverter hard-crashes
+          // on a degenerate/empty cloud (e.g. a stage that fit zero stems). Don't let
+          // that abort the chain — skip this octree and keep going so the rest of the
+          // run, the feature ingest, and the final tagging all still complete.
+          try { produced.push(await handlePoints(fpath, out, analysisId)) }
+          catch (e) { console.error('octree build failed (non-fatal):', out.file, errMsg(e).slice(0, 300)) }
+        }
         else if (out.role === 'table')  produced.push(await handleTable(fpath, out, analysisId))
       }
       await supabase.from('lidar_analyses').update({
@@ -463,7 +500,7 @@ async function runAnalyses(cloudJobId, ids) {
       console.log('analysis ready', a.id, analysisId)
     } catch (e) {
       await supabase.from('lidar_analyses').update({
-        status: 'failed', error: String(e).slice(0, 500), updated_at: new Date().toISOString(),
+        status: 'failed', error: errMsg(e).slice(0, 500), updated_at: new Date().toISOString(),
       }).eq('id', analysisId)
       throw e
     }
@@ -471,7 +508,7 @@ async function runAnalyses(cloudJobId, ids) {
   if (featuresIngested) {
     // Stamp each tree/stem with the compartment that contains it (one SQL pass).
     try { await supabase.rpc('tag_analysis_geometry', { p_estate: job.site_id }) }
-    catch (e) { console.error('tag_analysis_geometry failed (non-fatal):', String(e).slice(0, 200)) }
+    catch (e) { console.error('tag_analysis_geometry failed (non-fatal):', errMsg(e).slice(0, 300)) }
   }
   await fsp.rm(work, { recursive: true, force: true })
 }
