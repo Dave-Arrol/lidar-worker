@@ -227,6 +227,20 @@ async function uploadFile(bucket, key, filePath, upsert = true) {
   }
 }
 
+// Write a derived output to S3 (the app/layer lane), namespaced by the logical
+// bucket as a key prefix so it matches the portal's storage convention
+// (storage.signedUrl('site-layers', path) -> s3://S3_BUCKET/site-layers/path).
+async function uploadFileS3(logicalBucket, key, filePath) {
+  const contentType = UPLOAD_MIME[path.extname(key).toLowerCase()] || 'application/octet-stream'
+  const dest = `s3://${S3_BUCKET}/${logicalBucket}/${key}`
+  await run('aws', ['s3', 'cp', filePath, dest, '--no-progress', '--content-type', contentType, '--region', AWS_REGION])
+}
+async function removeS3(logicalBucket, keys) {
+  for (const k of keys) {
+    try { await run('aws', ['s3', 'rm', `s3://${S3_BUCKET}/${logicalBucket}/${k}`, '--region', AWS_REGION]) } catch {}
+  }
+}
+
 // ---- existing octree conversion (unchanged behaviour) ----
 app.post('/process', (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
@@ -311,7 +325,7 @@ async function handleRaster(file, output, siteId, type) {
   await run('gdalwarp', ['-t_srs', 'EPSG:3857', '-r', 'bilinear', '-overwrite', toWarp, merc])
   await run('gdal_translate', [merc, cog, '-of', 'COG', '-co', 'OVERVIEWS=AUTO', ...comp])
   const key = `${siteId}/lidar-${type}-${Date.now()}.tif`
-  await uploadFile(LAYERS_BUCKET, key, cog)
+  await uploadFileS3(LAYERS_BUCKET, key, cog)
   await replaceLayer(siteId, output.name || type, {
     site_id: siteId, name: output.name || type, layer_type: output.kind || 'raster',
     storage_path: key, opacity: 1, visible: true, sort_order: 0,
@@ -339,7 +353,7 @@ async function replaceLayer(siteId, name, rowToInsert) {
   const { data: old } = await supabase.from('site_layers')
     .select('id,storage_path').eq('site_id', siteId).eq('name', name)
   if (old && old.length) {
-    await supabase.storage.from(LAYERS_BUCKET).remove(old.map(o => o.storage_path)).catch(() => {})
+    await removeS3(LAYERS_BUCKET, old.map(o => o.storage_path))
     await supabase.from('site_layers').delete().in('id', old.map(o => o.id))
   }
   await supabase.from('site_layers').insert(rowToInsert)
@@ -348,7 +362,7 @@ async function replaceLayer(siteId, name, rowToInsert) {
 // vector (GeoJSON, already EPSG:4326) -> register as a site_layers map overlay
 async function handleVector(file, output, siteId, type) {
   const key = `${siteId}/lidar-${type}-${Date.now()}.geojson`
-  await uploadFile(LAYERS_BUCKET, key, file)
+  await uploadFileS3(LAYERS_BUCKET, key, file)
   await replaceLayer(siteId, output.name || type, {
     site_id: siteId, name: output.name || type, layer_type: output.kind || 'points',
     storage_path: key, opacity: 1, visible: true, sort_order: 0,
@@ -532,6 +546,8 @@ async function runAnalyses(cloudJobId, ids) {
     catch (e) { console.error('tag_analysis_geometry failed (non-fatal):', errMsg(e).slice(0, 300)) }
   }
   await fsp.rm(work, { recursive: true, force: true })
+
+  
 }
 
 app.listen(PORT, () => console.log('lidar worker on', PORT))
