@@ -335,15 +335,20 @@ async function handleRaster(file, output, siteId, type) {
 }
 
 async function handlePoints(file, output, analysisId) {
-  const octDir = path.join(path.dirname(file), `oct-${analysisId}`)
-  await run('/opt/potree/PotreeConverter', [file, '-o', octDir, '--encoding', 'BROTLI'])
-  for (const f of await fsp.readdir(octDir)) await uploadFile(OCTREE_BUCKET, `analysis-${analysisId}/${f}`, path.join(octDir, f))
-  return { role: 'points', name: output.name, octree_path: `analysis-${analysisId}/metadata.json` }
+  // QC 3D view: build a COPC (same lane as /ingest) into S3; the portal serves it via
+  // the /api/lidar/copc proxy. Replaces the old PotreeConverter octree on Supabase.
+  const base = path.basename(file).replace(/\.la[sz]$/i, '')
+  const outCopc = path.join(path.dirname(file), `${base}.copc.laz`)
+  const tmpDir = path.join(path.dirname(file), `untwine-${base}`)
+  await run('untwine', ['-i', file, '-o', outCopc, '--temp_dir', tmpDir], { env: GEO_ENV })
+  const subkey = `analysis/${analysisId}/${base}.copc.laz`
+  await uploadFileS3('copc', subkey, outCopc)
+  return { role: 'points', name: output.name, copc_path: `copc/${subkey}` }
 }
 
 async function handleTable(file, output, analysisId) {
   const key = `${analysisId}/${output.file}`
-  await uploadFile(RESULTS_BUCKET, key, file)
+  await uploadFileS3(RESULTS_BUCKET, key, file)
   return { role: 'table', name: output.name, bucket: RESULTS_BUCKET, path: key }
 }
 
@@ -520,12 +525,11 @@ async function runAnalyses(cloudJobId, ids) {
           } catch (e) { console.error('feature ingest failed (non-fatal):', out.kind, errMsg(e).slice(0, 300)) }
         }
         else if (out.role === 'points') {
-          // Octree is only for the optional 3D viewer. PotreeConverter hard-crashes
-          // on a degenerate/empty cloud (e.g. a stage that fit zero stems). Don't let
-          // that abort the chain — skip this octree and keep going so the rest of the
-          // run, the feature ingest, and the final tagging all still complete.
+          // QC 3D viewer only: build a COPC for the viewer. untwine can fail on a
+          // degenerate/empty cloud (e.g. a stage that fit zero stems); keep it non-fatal
+          // so the rest of the run, feature ingest, and final tagging still complete.
           try { produced.push(await handlePoints(fpath, out, analysisId)) }
-          catch (e) { console.error('octree build failed (non-fatal):', out.file, errMsg(e).slice(0, 300)) }
+          catch (e) { console.error('points COPC build failed (non-fatal):', out.file, errMsg(e).slice(0, 300)) }
         }
         else if (out.role === 'table')  produced.push(await handleTable(fpath, out, analysisId))
       }
@@ -546,8 +550,6 @@ async function runAnalyses(cloudJobId, ids) {
     catch (e) { console.error('tag_analysis_geometry failed (non-fatal):', errMsg(e).slice(0, 300)) }
   }
   await fsp.rm(work, { recursive: true, force: true })
-
-  
 }
 
 app.listen(PORT, () => console.log('lidar worker on', PORT))
