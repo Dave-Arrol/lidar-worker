@@ -20,7 +20,8 @@ mercator for display, so the raster is written in 27700 unless --crs overrides.
 import argparse
 import json
 from pathlib import Path
-
+import memlog
+memlog.track("CHM")  
 import numpy as np
 import laspy
 import rasterio

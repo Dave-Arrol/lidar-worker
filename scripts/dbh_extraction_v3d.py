@@ -77,7 +77,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
-
+import memlog
+memlog.track("DBH Ex")  
 # ── PATHS ─────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[2]
 

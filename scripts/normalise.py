@@ -54,7 +54,8 @@ import laspy
 import CSF
 import pandas as pd
 from scipy.spatial import cKDTree
-
+import memlog
+memlog.track("normalise")  
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__,

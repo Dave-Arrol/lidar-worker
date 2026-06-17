@@ -54,7 +54,8 @@ import argparse
 import csv
 import colorsys
 from pathlib import Path
-
+import memlog
+memlog.track("segmentation")
 import laspy
 import matplotlib
 matplotlib.use('Agg')   # Headless-safe: no display required
@@ -66,6 +67,18 @@ from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from skimage.segmentation import watershed
 from sklearn.decomposition import PCA
+
+import os
+import sys
+# Allow importing the sibling tiler module regardless of CWD (the worker runs this
+# as /app/scripts/segmentation_v2.py, so sys.path[0] is that dir, but be explicit).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from copc_tiler import ensure_copc, iter_tiles, suggest_tile_size, cloud_info
+    _HAVE_TILER = True
+except Exception as _e:   # missing only matters for clouds large enough to tile
+    _HAVE_TILER = False
+    _TILER_IMPORT_ERROR = _e
 
 # ── PATHS (CLI) ───────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[2]
@@ -95,6 +108,16 @@ TREE_TOP_RADIUS = 0.8
 NMS_DISTANCE    = 0.8
 HMIN            = 12.0
 MIN_POINTS      = 20
+
+# ── Large-cloud tiling ────────────────────────────────────
+# Clouds with up to MAX_SINGLE_PASS points run the original single-pass path
+# (full read, byte-identical output). Bigger clouds are processed tile-by-tile over
+# a COPC index so peak memory stays flat in the cloud size. TILE_BUFFER must exceed
+# the largest crown radius, so a tree whose top is in a tile's core has its whole
+# crown + lower stem in view (otherwise its points could be mis-assigned at a seam).
+MAX_SINGLE_PASS = int(os.environ.get('SEG_MAX_SINGLE_PASS', '40000000'))
+TILE_BUFFER     = float(os.environ.get('SEG_TILE_BUFFER', '10.0'))
+TILE_TARGET_PTS = int(os.environ.get('SEG_TILE_TARGET_POINTS', '12000000'))
 
 # Provisional stem seed
 # Used to drive the radial filter. Not merely diagnostic — see module docstring.
@@ -160,9 +183,10 @@ def build_chm(x, y, z, x_min, y_min, resolution):
     n_rows = rows.max() + 1
 
     chm = np.zeros((n_rows, n_cols), dtype=np.float32)
-    for i in range(len(x)):
-        if z[i] > chm[rows[i], cols[i]]:
-            chm[rows[i], cols[i]] = z[i]
+    # Vectorised max-per-cell: identical result to the original per-point loop
+    # (CHM starts at 0 and heights are >=~0, so max-with-0 matches "if z > current"),
+    # but orders of magnitude faster - which matters now build_chm runs once per tile.
+    np.maximum.at(chm, (rows, cols), z.astype(np.float32))
 
     return chm, n_rows, n_cols
 
@@ -866,7 +890,10 @@ def _count_lookup(ids_array):
 # MAIN
 # ═══════════════════════════════════════════════════════════
 
-def main():
+def run_single_pass():
+    """Original full-cloud path: read the whole cloud, segment, and write every
+    output including the diagnostic LAS and top-view PNG. Used when the cloud fits
+    comfortably in RAM (<= MAX_SINGLE_PASS points). Behaviour is unchanged."""
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Read input ─────────────────────────────────────
@@ -1044,6 +1071,252 @@ def main():
     print(f"Candidate LAS saved: {OUTPUT_FILE}")
     print(f"  Points: {final_mask.sum():,}  |  Trees: {len(valid_trees_final):,}")
     print("  Note: radial filter has been applied. See segment summary CSV for per-tree retention stats.")
+
+
+# ═══════════════════════════════════════════════════════════
+# LARGE-CLOUD TILING  (segment per tile over a COPC index, then merge)
+# ═══════════════════════════════════════════════════════════
+
+def segment_region(x, y, z):
+    """Run the CHM -> treetop -> watershed -> stem-candidate pipeline on ONE
+    region's points and return everything the writers need, keyed by a region-local
+    tree id (treetop index i -> local id i+1).
+
+    This deliberately MIRRORS the compute half of run_single_pass(): the two are
+    kept in sync by hand rather than shared, so the proven single-pass path stays
+    byte-identical while the tiled path can evolve. Returns empty-but-valid arrays
+    for a region with no canopy, so an empty tile contributes nothing instead of
+    raising.
+    """
+    n_in = len(x)
+    empty = {
+        'ttx': np.zeros(0), 'tty': np.zeros(0), 'ttz_true': np.zeros(0),
+        'n_trees': 0, 'tree_top_lookup': {}, 'score_lookup': {}, 'radial_stats': {},
+        'raw_counts': {}, 'density_counts': {}, 'final_counts': {},
+        'valid_trees_final': np.zeros(0, dtype=np.int32),
+        'final_x': np.zeros(0), 'final_y': np.zeros(0), 'final_z': np.zeros(0),
+        'final_ids': np.zeros(0, dtype=np.int32),
+    }
+    if n_in == 0:
+        return empty
+
+    x_min, y_min = x.min(), y.min()
+
+    chm, n_rows, n_cols = build_chm(x, y, z, x_min, y_min, CHM_RESOLUTION)
+    chm_smooth = gaussian_filter(chm.astype(np.float32), sigma=1.0)
+
+    ttx, tty, ttz, tt_rows, tt_cols = detect_treetops(
+        chm_smooth, x_min, y_min, CHM_RESOLUTION, HMIN, TREE_TOP_RADIUS)
+    ttx, tty, ttz, tt_rows, tt_cols = non_maximum_suppression(
+        ttx, tty, ttz, tt_rows, tt_cols, NMS_DISTANCE)
+    n_trees = len(ttx)
+    if n_trees == 0:
+        return empty
+
+    spatial_index = cKDTree(np.vstack([x, y]).T)
+    ttz_true = refine_treetop_heights(
+        ttx, tty, x, y, z, spatial_index, chm_smooth, tt_rows, tt_cols, CHM_RESOLUTION)
+
+    seeds = np.zeros((n_rows, n_cols), dtype=np.int32)
+    for i in range(n_trees):
+        seeds[tt_rows[i], tt_cols[i]] = i + 1
+    chm_watershed = watershed(-chm_smooth, markers=seeds, mask=chm_smooth >= HMIN)
+
+    stem_x, stem_y, stem_z, stem_mask = extract_stem_candidates(
+        x, y, z, STEM_MIN_H, STEM_MAX_H)
+    tree_ids = assign_tree_ids_from_watershed(
+        stem_x, stem_y, chm_watershed, x_min, y_min, CHM_RESOLUTION, n_cols, n_rows)
+    tree_ids = apply_min_points_filter(tree_ids, MIN_POINTS)
+    raw_counts = _count_lookup(tree_ids)
+
+    stem_x, stem_y, stem_z, tree_ids, density_mask = apply_density_filter(
+        stem_x, stem_y, stem_z, tree_ids, DENSITY_RADIUS, DENSITY_MIN_NEIGHBOURS)
+    tree_ids = apply_min_points_filter(tree_ids, MIN_POINTS)
+    density_counts = _count_lookup(tree_ids)
+
+    unique_post, counts_post = np.unique(tree_ids, return_counts=True)
+    valid_trees = unique_post[(counts_post >= MIN_POINTS) & (unique_post > 0)]
+
+    score_lookup, rejected_ids = score_all_segments(
+        stem_x, stem_y, stem_z, tree_ids, valid_trees)
+    tree_ids[np.isin(tree_ids, list(rejected_ids))] = 0
+    valid_trees_final = np.array(
+        [int(t) for t in valid_trees if int(t) not in rejected_ids], dtype=np.int32)
+
+    radial_stats = {}
+    if APPLY_RADIAL_FILTER:
+        tree_ids, radial_stats = apply_radial_filter(
+            stem_x, stem_y, tree_ids, valid_trees_final, score_lookup)
+    final_counts = _count_lookup(tree_ids)
+
+    tree_top_lookup = {
+        i + 1: {'tree_top_x': float(ttx[i]), 'tree_top_y': float(tty[i]),
+                'canopy_height_m': float(ttz_true[i])}
+        for i in range(n_trees)
+    }
+
+    final_mask = tree_ids > 0
+    return {
+        'ttx': ttx, 'tty': tty, 'ttz_true': ttz_true, 'n_trees': n_trees,
+        'tree_top_lookup': tree_top_lookup, 'score_lookup': score_lookup,
+        'radial_stats': radial_stats, 'raw_counts': raw_counts,
+        'density_counts': density_counts, 'final_counts': final_counts,
+        'valid_trees_final': valid_trees_final,
+        'final_x': stem_x[final_mask], 'final_y': stem_y[final_mask],
+        'final_z': stem_z[final_mask], 'final_ids': tree_ids[final_mask],
+    }
+
+
+def run_tiled():
+    """Large-cloud path: index the cloud as COPC and segment it tile by tile,
+    merging trees across tiles with globally-unique IDs. Peak memory stays flat in
+    the cloud size. The whole-extent diagnostic LAS and top-view PNG are skipped;
+    the four registry outputs (candidates / treetop poles / treetops CSV / segment
+    summary) are produced identically."""
+    if not _HAVE_TILER:
+        sys.exit(f"[segmentation] copc_tiler not importable ({_TILER_IMPORT_ERROR}); "
+                 f"cannot tile a large cloud.")
+
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    copc = ensure_copc(str(INPUT_FILE))
+    n_pts, mn, mx = cloud_info(copc)
+    tile_size = suggest_tile_size(copc, target_points_per_tile=TILE_TARGET_PTS)
+    print(f"[segmentation] tiled mode: {n_pts:,} pts | tile_size={tile_size:.1f} m "
+          f"| buffer={TILE_BUFFER:.1f} m", flush=True)
+
+    g_ttx, g_tty, g_ttz = [], [], []
+    g_tree_top_lookup, g_score, g_radial = {}, {}, {}
+    g_raw, g_density, g_final = {}, {}, {}
+    g_fx, g_fy, g_fz, g_fid = [], [], [], []
+    next_id = 1
+    n_tiles = 0
+
+    for t in iter_tiles(copc, tile_size=tile_size, buffer=TILE_BUFFER):
+        n_tiles += 1
+        R = segment_region(t["x"], t["y"], t["z"])
+        if R['n_trees'] == 0:
+            continue
+
+        x0, y0, x1, y1 = t["core"]
+        is_last_col = (t["i"] == t["ncols"] - 1)
+        is_last_row = (t["j"] == t["nrows"] - 1)
+        ttx, tty = R['ttx'], R['tty']
+        # Treetop owned by THIS tile's core (half-open; far edge inclusive on the
+        # last column/row) - matches the point partition in copc_tiler, so every
+        # tree is owned by exactly one tile and seams dedupe automatically.
+        in_x = (ttx >= x0) & ((ttx <= x1) if is_last_col else (ttx < x1))
+        in_y = (tty >= y0) & ((tty <= y1) if is_last_row else (tty < y1))
+        core_top = in_x & in_y
+
+        local_to_global = {}
+        for li in range(R['n_trees']):
+            if not core_top[li]:
+                continue
+            lid = li + 1
+            gid = next_id
+            next_id += 1
+            local_to_global[lid] = gid
+            g_ttx.append(float(ttx[li]))
+            g_tty.append(float(tty[li]))
+            g_ttz.append(float(R['ttz_true'][li]))
+            g_tree_top_lookup[gid] = R['tree_top_lookup'][lid]
+            if lid in R['score_lookup']:
+                g_score[gid] = R['score_lookup'][lid]
+            if lid in R['radial_stats']:
+                g_radial[gid] = R['radial_stats'][lid]
+            g_raw[gid] = R['raw_counts'].get(lid, 0)
+            g_density[gid] = R['density_counts'].get(lid, 0)
+            g_final[gid] = R['final_counts'].get(lid, 0)
+
+        if len(R['final_ids']) and local_to_global:
+            owned = np.fromiter(local_to_global.keys(), dtype=np.int64)
+            keep = np.isin(R['final_ids'], owned)
+            if keep.any():
+                fid_local = R['final_ids'][keep]
+                fid_global = np.array([local_to_global[int(v)] for v in fid_local],
+                                      dtype=np.int32)
+                g_fx.append(R['final_x'][keep])
+                g_fy.append(R['final_y'][keep])
+                g_fz.append(R['final_z'][keep])
+                g_fid.append(fid_global)
+
+        print(f"  tile ({t['i']},{t['j']}): trees(core)={len(local_to_global)} "
+              f"running_total={next_id - 1}", flush=True)
+
+    n_trees_global = next_id - 1
+    if n_trees_global == 0:
+        raise RuntimeError('No trees detected across any tile.')
+
+    ttx = np.array(g_ttx)
+    tty = np.array(g_tty)
+    ttz_true = np.array(g_ttz)
+    if g_fx:
+        final_x = np.concatenate(g_fx)
+        final_y = np.concatenate(g_fy)
+        final_z = np.concatenate(g_fz)
+        final_ids = np.concatenate(g_fid)
+    else:
+        final_x = np.zeros(0)
+        final_y = np.zeros(0)
+        final_z = np.zeros(0)
+        final_ids = np.zeros(0, dtype=np.int32)
+
+    print(f"[segmentation] merged: {n_trees_global:,} trees | "
+          f"{len(final_x):,} stem-candidate points across {n_tiles} tiles", flush=True)
+
+    print("Saving segment summary CSV...")
+    save_segment_summary_csv(
+        SEGMENT_SUMMARY_CSV, n_trees_global, g_tree_top_lookup,
+        g_score, g_radial, g_raw, g_density, g_final)
+    print(f"Segment summary saved: {SEGMENT_SUMMARY_CSV}")
+
+    print("Exporting treetop poles...")
+    save_treetop_poles(TREETOPS_FILE, ttx, tty, ttz_true)
+    save_treetops_csv(TREETOPS_CSV, ttx, tty, ttz_true)
+
+    if len(final_x) == 0:
+        raise RuntimeError('No candidate points remain after all filtering stages.')
+
+    print("Assigning colours...")
+    max_id = int(final_ids.max()) + 1
+    colour_map = np.zeros((max_id, 3), dtype=np.uint16)
+    present_ids = np.unique(final_ids)
+    distinct = generate_distinct_colours(len(present_ids) + 1)
+    for k, tid in enumerate(present_ids):
+        colour_map[int(tid)] = distinct[k]
+    colour_map[0] = [0, 0, 0]
+    point_colours = colour_map[final_ids]
+    pr = point_colours[:, 0]
+    pg = point_colours[:, 1]
+    pb = point_colours[:, 2]
+
+    print("Saving final candidate LAS...")
+    save_candidate_las(OUTPUT_FILE, final_x, final_y, final_z, final_ids, pr, pg, pb)
+    print(f"Candidate LAS saved: {OUTPUT_FILE}")
+    print(f"  Points: {len(final_x):,}  |  Trees: {n_trees_global:,}  |  Tiles: {n_tiles}")
+    print("  Note: tiled mode - diagnostic LAS and top-view PNG are skipped.")
+
+
+def main():
+    """Dispatch on cloud size: small clouds use the original single-pass path;
+    large clouds are tiled over a COPC index so peak memory stays flat
+    (see copc_tiler.py). Threshold is SEG_MAX_SINGLE_PASS (env, default 40M)."""
+    try:
+        with laspy.open(INPUT_FILE) as _r:
+            n_pts = int(_r.header.point_count)
+    except Exception as e:
+        print(f"[segmentation] header probe failed ({e}); using single-pass.")
+        n_pts = 0
+
+    if n_pts > MAX_SINGLE_PASS and _HAVE_TILER:
+        print(f"[segmentation] {n_pts:,} points > {MAX_SINGLE_PASS:,} -> tiled mode.")
+        run_tiled()
+    else:
+        if n_pts > MAX_SINGLE_PASS and not _HAVE_TILER:
+            print("[segmentation] large cloud but copc_tiler unavailable; "
+                  "attempting single-pass (may run out of memory).")
+        run_single_pass()
 
 
 if __name__ == '__main__':
