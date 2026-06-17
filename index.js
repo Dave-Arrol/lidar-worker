@@ -90,8 +90,16 @@ async function ingestCopc(key, outKeyArg, jobId) {
   const outFile = path.join(work, 'out.copc.laz')
   const tmpDir = path.join(work, 'untwine_tmp')
   try {
+    // untwine is given --temp_dir below; it must exist first (mkdtemp only made the parent).
+    await fsp.mkdir(tmpDir, { recursive: true })
     console.log('[ingest] download', s3(key))
     await run('aws', ['s3', 'cp', s3(key), inFile, '--no-progress', ...region])
+    // Diagnostics: prove what disk the temp area actually has, and how big the input is.
+    try {
+      const inGiB = ((await fsp.stat(inFile)).size / 1073741824).toFixed(2)
+      console.log(`[ingest] input size: ${inGiB} GiB — temp disk for ${work}:`)
+      await run('df', ['-h', work])
+    } catch (e) { console.log('[ingest] disk check skipped:', String(e)) }
     console.log('[ingest] untwine -> COPC')
     await run('untwine', ['-i', inFile, '-o', outFile, '--temp_dir', tmpDir], { env: GEO_ENV })
     console.log('[ingest] upload', s3(outKey))
@@ -116,7 +124,10 @@ function run(cmd, args, opts = {}) {
     execFile(cmd, args, { maxBuffer: 1024 * 1024 * 64, ...opts }, (err, stdout, stderr) => {
       if (stdout) console.log('[stdout]', stdout)
       if (stderr) console.log('[stderr]', stderr)
-      err ? reject(new Error([stderr, stdout, err.message].filter(Boolean).join(' | '))) : resolve(stdout)
+      if (err) {
+        const why = err.signal ? ` [killed: ${err.signal}]` : (err.code != null ? ` [exit ${err.code}]` : '')
+        reject(new Error([stderr, stdout, err.message + why].filter(Boolean).join(' | ')))
+      } else resolve(stdout)
     })
   })
 }
