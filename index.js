@@ -78,6 +78,30 @@ app.post('/ingest', (req, res) => {
   })
 })
 
+// Detect whether an uploaded S3 object is ALREADY a COPC, without downloading it.
+// Fast path: the .copc.laz name. Otherwise peek at the first 64 KB (a ranged GET) and
+// look for the mandatory COPC info VLR (user_id "copc"), which sits right after the LAS
+// header. Lets us skip re-conversion for clouds that are already COPC - and, crucially,
+// avoids trying to pull a multi-hundred-GB file onto the task's ephemeral disk.
+async function isCopc(key) {
+  if (/\.copc\.la[sz]$/i.test(key)) return true
+  const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'copcprobe-'))
+  const head = path.join(work, 'head.bin')
+  try {
+    await run('aws', ['s3api', 'get-object', '--bucket', S3_BUCKET, '--key', key,
+                      '--range', 'bytes=0-65535', head, '--region', AWS_REGION])
+    const buf = await fsp.readFile(head)
+    if (buf.length < 4 || buf.slice(0, 4).toString('latin1') !== 'LASF') return false
+    // COPC info VLR (user_id "copc") is the first VLR, ~byte 377; scan a generous window.
+    return buf.slice(0, 8192).includes(Buffer.from('copc'))
+  } catch (e) {
+    console.error('[ingest] COPC probe failed (will convert):', String(e).slice(0, 200))
+    return false
+  } finally {
+    await fsp.rm(work, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
 async function ingestCopc(key, outKeyArg, jobId) {
   const s3 = (k) => `s3://${S3_BUCKET}/${k}`
   const region = ['--region', AWS_REGION]
@@ -85,21 +109,29 @@ async function ingestCopc(key, outKeyArg, jobId) {
   const base = path.basename(key).replace(/\.(la[sz])$/i, '')
   const outKey = outKeyArg || `copc/${base}.copc.laz`
 
+  // Already a COPC? Register it in place - no download, no re-conversion. This is what
+  // makes very large clouds work: a 240 GB file can't fit the task's ephemeral disk, so
+  // we point the job straight at the uploaded object (the viewer + analysis read COPC
+  // from S3 by range). Conversion only runs for genuine LAS/LAZ below.
+  if (await isCopc(key)) {
+    console.log('[ingest] already COPC -> register in place, skip conversion:', key)
+    if (jobId && supabase) {
+      try {
+        await supabase.from('lidar_jobs')
+          .update({ copc_path: key, status: 'ready', updated_at: new Date().toISOString() })
+          .eq('id', jobId)
+      } catch (e2) { console.error('[ingest] row update failed (COPC is fine):', String(e2)) }
+    }
+    return
+  }
+
   const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'ingest-'))
   const inFile = path.join(work, 'in' + inExt)
   const outFile = path.join(work, 'out.copc.laz')
   const tmpDir = path.join(work, 'untwine_tmp')
   try {
-    // untwine is given --temp_dir below; it must exist first (mkdtemp only made the parent).
-    await fsp.mkdir(tmpDir, { recursive: true })
     console.log('[ingest] download', s3(key))
     await run('aws', ['s3', 'cp', s3(key), inFile, '--no-progress', ...region])
-    // Diagnostics: prove what disk the temp area actually has, and how big the input is.
-    try {
-      const inGiB = ((await fsp.stat(inFile)).size / 1073741824).toFixed(2)
-      console.log(`[ingest] input size: ${inGiB} GiB — temp disk for ${work}:`)
-      await run('df', ['-h', work])
-    } catch (e) { console.log('[ingest] disk check skipped:', String(e)) }
     console.log('[ingest] untwine -> COPC')
     await run('untwine', ['-i', inFile, '-o', outFile, '--temp_dir', tmpDir], { env: GEO_ENV })
     console.log('[ingest] upload', s3(outKey))
@@ -124,10 +156,7 @@ function run(cmd, args, opts = {}) {
     execFile(cmd, args, { maxBuffer: 1024 * 1024 * 64, ...opts }, (err, stdout, stderr) => {
       if (stdout) console.log('[stdout]', stdout)
       if (stderr) console.log('[stderr]', stderr)
-      if (err) {
-        const why = err.signal ? ` [killed: ${err.signal}]` : (err.code != null ? ` [exit ${err.code}]` : '')
-        reject(new Error([stderr, stdout, err.message + why].filter(Boolean).join(' | ')))
-      } else resolve(stdout)
+      err ? reject(new Error([stderr, stdout, err.message].filter(Boolean).join(' | '))) : resolve(stdout)
     })
   })
 }

@@ -444,6 +444,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     comp_ff: Dict[Any, float] = {c["id"]: _species_form_factor(c.get("species"), fallback_ff) for c in comps}
     comp_species: Dict[Any, Optional[str]] = {c["id"]: _norm_species(c.get("species")) for c in comps}
 
+    # ---- Diagnostics: surface why a compartment may end up empty (prints to CloudWatch) ----
+    _n_assigned = sum(1 for v in tree_comp.values() if v is not None)
+    _gtypes = sorted({((c.get("geom") or {}).get("type") or "?") for c in comps}) if comps else []
+    print(f"[tariff] compartments loaded={len(comps)} types={_gtypes} | "
+          f"trees={len(population)} assigned={_n_assigned} "
+          f"unassigned={len(population) - _n_assigned}", flush=True)
+    if comps and _n_assigned == 0:
+        _samp = next(iter(tree_ll.values()), None)
+        print(f"[tariff] WARNING: 0 trees fell inside any compartment - likely a CRS or "
+              f"coverage mismatch. sample tree lon/lat={_samp} | "
+              f"compartment[0] bbox(lon/lat)={comps[0].get('bbox')} | input crs={args.crs}",
+              flush=True)
+    elif not comps:
+        print("[tariff] no compartment boundaries supplied (empty/missing compartments.geojson) "
+              "- per-compartment CSV will be header-only.", flush=True)
+
     # ---- Steps 1+2: derive tariff numbers from volume sample trees ----
     sample_tariffs: List[float] = []
     sample_t_by_tid: Dict[int, float] = {}  # tree_id -> its own tariff (for per-compartment refit)
@@ -631,7 +647,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         warnings.append(f"{n_unassigned} tree(s) fell outside every compartment boundary "
                         f"(counted in the stand total, not in any compartment).")
 
-    if args.out_compartments and comp_rows:
+    if args.out_compartments:   # always emit (header-only if no trees landed in a compartment) so the declared output exists
         cfields = ["compartment_id", "ref", "species", "tree_count", "sample_trees", "tariff", "tariff_rounded",
                    "tariff_source", "confidence", "mean_dbh_cm", "mean_height_m",
                    "merch_volume_m3", "area_hectares", "volume_per_ha_m3"]
