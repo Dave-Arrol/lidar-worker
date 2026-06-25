@@ -1,5 +1,5 @@
 """
-chm.py  –  Canopy Height Model raster from a normalised LAS (max height per cell).
+chm.py  -  Canopy Height Model raster from a normalised LAS (max height per cell).
 
 Stage of the Arrol algorithmic pipeline. Invoked by the worker registry as:
 
@@ -15,17 +15,25 @@ a site_layers map overlay.
 The point-cloud X/Y are absolute OSGB36 eastings/northings (EPSG:27700) carried
 through from the source header by normalise; the worker reprojects to web
 mercator for display, so the raster is written in 27700 unless --crs overrides.
+
+Memory: the cloud is read in chunks (laspy.open + chunk_iterator) and reduced
+into the grid incrementally, so peak RAM is the output grid plus one chunk -
+not the whole point cloud. Reading the full cloud with laspy.read() allocates
+the entire point block as one buffer and OOMs on large clouds.
 """
 
 import argparse
 import json
 from pathlib import Path
-import memlog
-memlog.track("CHM")  
+
 import numpy as np
 import laspy
 import rasterio
 from rasterio.transform import from_origin
+
+# Points per streaming chunk. ~5M points is a few hundred MB of working arrays -
+# comfortable headroom on a 16 GiB container even if another stage is resident.
+CHUNK = 5_000_000
 
 
 def main():
@@ -38,28 +46,44 @@ def main():
     ap.add_argument('--crs',         default='EPSG:27700',
                     help='CRS of the LAS X/Y (UK national grid). Worker reprojects to 3857.')
     a = ap.parse_args()
-
-    print(f"Reading {a.input} ...")
-    las = laspy.read(a.input)
-    x = np.asarray(las.x, dtype=float)
-    y = np.asarray(las.y, dtype=float)
-    z = np.asarray(las.z, dtype=float)   # normalised height above ground
     res = a.resolution
-    print(f"  Points: {len(x):,}")
 
-    x_min, y_min, x_max, y_max = x.min(), y.min(), x.max(), y.max()
-    ncols = int((x_max - x_min) / res) + 1
-    nrows = int((y_max - y_min) / res) + 1
-    print(f"  CHM grid: {nrows} x {ncols} px at {res} m")
+    print(f"Reading {a.input} (streaming) ...")
+    with laspy.open(a.input) as reader:
+        h       = reader.header
+        n_total = h.point_count
 
-    # Max height per cell. Vectorised np.maximum.at over an init-zero grid is
-    # identical to "if z > chm[cell]: chm[cell] = z" (heights are >= ~0, so a
-    # cell touched only by sub-zero noise stays 0 = nodata) but avoids a
-    # 100M-iteration Python loop.
-    cols = ((x - x_min) / res).astype(int)
-    rows = ((y - y_min) / res).astype(int)
-    chm = np.zeros((nrows, ncols), dtype=np.float32)
-    np.maximum.at(chm, (rows, cols), z.astype(np.float32))
+        # Grid extent from the header X/Y bounds (absolute OSGB eastings/northings).
+        # For a laspy-written LAS these equal the true data bounds, so the raster
+        # origin matches the old full-read behaviour exactly.
+        x_min, y_min = float(h.mins[0]), float(h.mins[1])
+        x_max, y_max = float(h.maxs[0]), float(h.maxs[1])
+        ncols = int((x_max - x_min) / res) + 1
+        nrows = int((y_max - y_min) / res) + 1
+        print(f"  Points: {n_total:,}")
+        print(f"  CHM grid: {nrows} x {ncols} px at {res} m")
+
+        # Max height per cell, accumulated chunk by chunk. np.maximum.at over an
+        # init-zero grid is identical to "if z > chm[cell]: chm[cell] = z"
+        # (heights are >= ~0, so a cell touched only by sub-zero noise stays 0 =
+        # nodata) and composes cleanly across chunks - the running maximum is
+        # order-independent.
+        chm  = np.zeros((nrows, ncols), dtype=np.float32)
+        seen = 0
+        for pts in reader.chunk_iterator(CHUNK):
+            x = np.asarray(pts.x, dtype=float)
+            y = np.asarray(pts.y, dtype=float)
+            z = np.asarray(pts.z, dtype=np.float32)   # normalised height above ground
+
+            cols = ((x - x_min) / res).astype(int)
+            rows = ((y - y_min) / res).astype(int)
+            # Guard against a point sitting exactly on (or a hair past) the max edge.
+            np.clip(cols, 0, ncols - 1, out=cols)
+            np.clip(rows, 0, nrows - 1, out=rows)
+
+            np.maximum.at(chm, (rows, cols), z)
+            seen += len(x)
+            print(f"    ...{seen:,}/{n_total:,} points", flush=True)
 
     chm = np.flipud(chm)  # north-up for GeoTIFF
     transform = from_origin(x_min, y_max, res, res)
