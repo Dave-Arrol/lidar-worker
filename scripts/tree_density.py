@@ -8,8 +8,8 @@ Stage of the Arrol algorithmic pipeline. Invoked by the worker registry as:
       --out-geojson <shared>/tree_density.geojson \
       --out-summary <shared>/tree_density_summary.json
 
-Bins the tree-top XY positions onto a regular hexagonal grid (default ~100 m^2
-cells = 1/100 ha) and writes a GeoJSON of hexagon polygons (EPSG:4326), each
+Bins the tree-top XY positions onto a regular hexagonal grid (default ~25 m^2
+cells = 1/400 ha) and writes a GeoJSON of hexagon polygons (EPSG:4326), each
 carrying its stem density in trees/ha. Discrete hexes render as a flat-filled
 choropleth on the 2D map rather than a smoothed heat-map raster. A normalised
 'd_norm' (0..1 against the layer max) drives a consistent green->red fill.
@@ -46,8 +46,8 @@ def main():
     ap.add_argument('--input',       required=True, help='Tree-tops CSV (tree_id,x,y,height_m).')
     ap.add_argument('--out-geojson', required=True, help='Output hexagon density GeoJSON (EPSG:4326).')
     ap.add_argument('--out-summary', required=True, help='Output summary .json.')
-    ap.add_argument('--hex-area',    type=float, default=100.0,
-                    help='Hexagon area in m^2. Default 100 (1/100 ha).')
+    ap.add_argument('--hex-area',    type=float, default=25.0,
+                    help='Hexagon area in m^2. Default 25 (1/400 ha).')
     ap.add_argument('--crs',         default='EPSG:27700', help='CRS of the tree X/Y.')
     a = ap.parse_args()
 

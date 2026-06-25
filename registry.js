@@ -110,7 +110,7 @@ const REGISTRY = [
   {
     id: 'density',
     label: 'Tree density',
-    description: 'Stem density (trees/ha) as hexagon bins (~100 m² / 0.01 ha), from the tree tops.',
+    description: 'Stem density (trees/ha) as hexagon bins (~25 m² / 0.01 ha), from the tree tops.',
     dependsOn: ['treetops'],
     script: 'tree_density.py',
     args: (c) => ['--input', c.f('treetops_std.csv'),
