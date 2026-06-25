@@ -50,6 +50,39 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 const app = express()
 app.use(express.json())
 
+// ---------------------------------------------------------------------------
+// Serial job queue. COPC ingest, octree build and analysis all run heavy Python
+// stages that share this one task's RAM and ephemeral disk, so running several
+// at once (multiple uploads across sites) exhausts memory/disk and kills the
+// task. Process them one at a time (WORKER_CONCURRENCY, default 1). The queue is
+// in-memory: if the task restarts, in-flight/queued rows stay 'queued'/'processing'
+// in the DB and can simply be re-run from the portal.
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENT = Math.max(1, parseInt(clean(process.env.WORKER_CONCURRENCY) || '1', 10))
+const jobQueue = []
+let activeJobs = 0
+function enqueue(label, fn) {
+  jobQueue.push({ label, fn })
+  const position = activeJobs + jobQueue.length
+  console.log(`[queue] + ${label} | active ${activeJobs}/${MAX_CONCURRENT} | waiting ${jobQueue.length}`)
+  pumpQueue()
+  return position
+}
+function pumpQueue() {
+  while (activeJobs < MAX_CONCURRENT && jobQueue.length) {
+    const { label, fn } = jobQueue.shift()
+    activeJobs++
+    console.log(`[queue] start ${label} | active ${activeJobs}/${MAX_CONCURRENT} | waiting ${jobQueue.length}`)
+    Promise.resolve().then(fn)
+      .catch((e) => console.error(`[queue] error ${label}:`, e))
+      .finally(() => {
+        activeJobs--
+        console.log(`[queue] done ${label} | active ${activeJobs}/${MAX_CONCURRENT} | waiting ${jobQueue.length}`)
+        pumpQueue()
+      })
+  }
+}
+
 app.get('/health', (_req, res) => res.json({ ok: true }))
 app.get('/registry', (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
@@ -64,18 +97,22 @@ app.post('/ingest', (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
   const { key, outKey, jobId } = req.body || {}
   if (!key) return res.status(400).json({ error: 'key required — the S3 key of the uploaded .las/.laz' })
-  res.status(202).json({ accepted: true, key })
-  ingestCopc(key, outKey, jobId).catch(async (e) => {
-    console.error('[ingest] failed', key, String(e))
-    // Surface the failure to the portal so the panel can show it (best-effort).
-    if (jobId && supabase) {
-      try {
-        await supabase.from('lidar_jobs')
-          .update({ status: 'failed', error: String(e).slice(0, 500), updated_at: new Date().toISOString() })
-          .eq('id', jobId)
-      } catch (_) {}
+  const position = enqueue(`ingest ${jobId || key}`, async () => {
+    try {
+      await ingestCopc(key, outKey, jobId)
+    } catch (e) {
+      console.error('[ingest] failed', key, String(e))
+      // Surface the failure to the portal so the panel can show it (best-effort).
+      if (jobId && supabase) {
+        try {
+          await supabase.from('lidar_jobs')
+            .update({ status: 'failed', error: String(e).slice(0, 500), updated_at: new Date().toISOString() })
+            .eq('id', jobId)
+        } catch (_) {}
+      }
     }
   })
+  res.status(202).json({ accepted: true, key, queued: position })
 })
 
 // Detect whether an uploaded S3 object is ALREADY a COPC, without downloading it.
@@ -286,12 +323,12 @@ app.post('/process', (req, res) => {
   if (req.headers['x-worker-secret'] !== WORKER_SECRET) return res.status(401).json({ error: 'unauthorized' })
   const { jobId, rawPath } = req.body || {}
   if (!jobId || !rawPath) return res.status(400).json({ error: 'jobId and rawPath required' })
-  res.status(202).json({ accepted: true })
-  convertJob(jobId, rawPath).catch((e) => {
+  const position = enqueue(`octree ${jobId}`, () => convertJob(jobId, rawPath).catch((e) => {
     // Octree is the optional 3D-view artifact — log the failure but DON'T touch the
     // cloud's status, so analysis (which uses the raw LAS) stays available regardless.
     console.error('octree build failed', jobId, e)
-  })
+  }))
+  res.status(202).json({ accepted: true, queued: position })
 })
 
 async function convertJob(jobId, rawPath) {
@@ -327,8 +364,8 @@ app.post('/analyse', (req, res) => {
   const { cloudJobId, analyses } = req.body || {}
   if (!cloudJobId || !Array.isArray(analyses) || !analyses.length)
     return res.status(400).json({ error: 'cloudJobId and analyses[] required' })
-  res.status(202).json({ accepted: true })
-  runAnalyses(cloudJobId, analyses).catch(e => console.error('analyse error', e))
+  const position = enqueue(`analyse ${cloudJobId}`, () => runAnalyses(cloudJobId, analyses).catch(e => console.error('analyse error', e)))
+  res.status(202).json({ accepted: true, queued: position })
 })
 
 async function gdalBands(file) {
