@@ -629,4 +629,14 @@ async function runAnalyses(cloudJobId, ids) {
   await fsp.rm(work, { recursive: true, force: true })
 }
 
-app.listen(PORT, () => console.log('lidar worker on', PORT))
+// Default entry: run as the long-lived HTTP server (the legacy always-on service).
+// When index.js is REQUIRED by run-once.js (per-job ECS RunTask mode) we must NOT
+// listen - run-once imports the job functions below and calls one directly, then
+// exits, so each job gets its own short-lived Fargate task.
+if (require.main === module) {
+  app.listen(PORT, () => console.log('lidar worker on', PORT))
+}
+
+// Exposed so run-once.js can run a single job in a one-shot task instead of routing
+// it through the HTTP server + in-memory queue. The pipeline itself is unchanged.
+module.exports = { app, supabase, ingestCopc, convertJob, runAnalyses }
