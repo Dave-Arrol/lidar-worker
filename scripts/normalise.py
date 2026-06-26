@@ -12,7 +12,7 @@ Outputs
 -------
   --out-las     A normalised .las file  –  Z values are height above ground (m).
                 X/Y, CRS, scales and offsets are inherited from the input header
-                unchanged, so downstream Potree conversion stays georeferenced.
+                unchanged, so downstream conversion stays georeferenced.
   --out-ground  A ground surface .csv (columns: x,y,ground_z) –  downsampled
                 ground points on a regular grid, consumed by dbh_extraction
                 (np.loadtxt, skiprows=1; positional columns x,y,ground_z).
@@ -20,6 +20,21 @@ Outputs
 The CSF and grid parameters are exposed as optional flags whose defaults match
 the original hardcoded SETTINGS block exactly. The registry does not pass them,
 so default behaviour is byte-identical to the standalone script.
+
+Streaming I/O
+-------------
+The cloud is read and written in CHUNKS (laspy.chunk_iterator / LasWriter),
+never a single laspy.read()/write() of the whole point block. A whole-file read
+of a very large LAZ (~1e9 points, tens of GB decompressed) overflows the LAZ
+backend's 32-bit buffer offset: every point past the overflow boundary decodes
+from the wrong place in memory, producing impossible negative coordinates and
+scrambled axes, which then crashes CSF with a multi-kilometre bounding box.
+Chunked reads keep each decode buffer small and are the only path proven correct
+on billion-point Terra exports (a chunked min/max scan of such a cloud returns
+values exactly matching its header; a whole-file read does not). The write is
+chunked for the same reason, replacing only Z per chunk with the normalised
+height. out_header scales/offsets MUST match the source so each chunk's existing
+integer X/Y decode identically on read-back.
 """
 
 import argparse
@@ -31,6 +46,11 @@ import numpy as np
 import laspy
 import CSF
 from scipy.spatial import cKDTree
+
+
+# Points per chunk for streamed read/write. 20M keeps each LAZ decode/encode
+# buffer well under the 2^31-byte overflow boundary while staying I/O-efficient.
+CHUNK = 20_000_000
 
 
 def parse_args():
@@ -72,10 +92,41 @@ def parse_args():
 def main():
     a = parse_args()
 
-    # ── READ ───────────────────────────────────────────────────
-    print("Reading file...")
-    las    = laspy.read(a.input)
-    points = np.vstack([las.x, las.y, las.z]).T
+    # ── READ (streamed) ────────────────────────────────────────
+    # Stream the cloud in chunks into one preallocated array. A whole-file
+    # laspy.read() overflows the LAZ backend on billion-point clouds and
+    # manufactures corrupt coordinates; chunked reads do not. Capture the source
+    # header fields here (version / point format / scales / offsets / CRS) — the
+    # file is reopened for the streamed write later, after the source `with`
+    # block has closed.
+    print("Reading file (streamed)...")
+    with laspy.open(a.input) as reader:
+        hdr         = reader.header
+        n_points    = hdr.point_count
+        src_version = hdr.version
+        src_pf      = hdr.point_format
+        src_scales  = np.array(hdr.scales,  dtype=np.float64)
+        src_offsets = np.array(hdr.offsets, dtype=np.float64)
+        try:
+            src_crs = hdr.parse_crs()
+        except Exception as exc:
+            print(f"  (could not read source CRS, continuing without it: {exc})")
+            src_crs = None
+
+        points = np.empty((n_points, 3), dtype=np.float64)
+        filled = 0
+        for chunk in reader.chunk_iterator(CHUNK):
+            m = len(chunk.x)
+            points[filled:filled + m, 0] = chunk.x
+            points[filled:filled + m, 1] = chunk.y
+            points[filled:filled + m, 2] = chunk.z
+            filled += m
+            print(f"  ...read {filled:,} / {n_points:,} points", flush=True)
+
+    if filled != n_points:
+        sys.exit(f"ERROR: read {filled:,} points but the header declared "
+                 f"{n_points:,}; the input may be truncated.")
+
     print(f"Total points: {len(points):,}")
     print(f"Z range before normalisation: "
           f"{points[:, 2].min():.2f} -> {points[:, 2].max():.2f}")
@@ -131,35 +182,42 @@ def main():
     if ground_z_after.std() > 0.5:
         print("  WARNING: high ground StdDev — consider reducing --cloth-res or --threshold.")
 
-    # ── SAVE NORMALISED LAS ────────────────────────────────────
-    # Build a *clean* plain-LAS header rather than reusing the source header.
-    # The input may be a COPC read straight from S3; surgically deleting its
-    # VLRs from a reused header can leave header fields inconsistent with the
-    # point block, producing a file that writes but will not read back -- which
-    # is what made chm.py fail downstream. Creating a fresh header of the same
-    # point format and copying only scales/offsets/CRS guarantees a valid LAS.
-    print("\nSaving normalised LAS...")
+    # ── SAVE NORMALISED LAS (streamed) ─────────────────────────
+    # Build a *clean* plain-LAS header (same point format / scales / offsets / CRS
+    # as the source, no source VLRs) and stream the points back out chunk by
+    # chunk, replacing only Z with the normalised height. Streaming the write,
+    # like the read, avoids the whole-file backend overflow on huge clouds.
+    # out_header scales/offsets MUST equal the source so each chunk's existing
+    # integer X/Y (and the re-encoded Z) decode correctly on read-back. Re-reading
+    # the source here (rather than holding every attribute in RAM) keeps the
+    # working set down and preserves intensity/returns/classification untouched.
+    print("\nSaving normalised LAS (streamed)...")
     out_las_path = Path(a.out_las)
     out_las_path.parent.mkdir(parents=True, exist_ok=True)
 
-    src_header = las.header
-    out_header = laspy.LasHeader(version=src_header.version,
-                                 point_format=src_header.point_format)
-    out_header.scales  = src_header.scales
-    out_header.offsets = src_header.offsets
-    # Carry the CRS across without dragging any source VLRs along. chm reads only
-    # X/Y/Z and sets its own CRS, so a missing CRS here is non-fatal.
-    try:
-        src_crs = src_header.parse_crs()
-        if src_crs is not None:
+    out_header = laspy.LasHeader(version=src_version, point_format=src_pf)
+    out_header.scales  = src_scales
+    out_header.offsets = src_offsets
+    # Carry the CRS across without dragging source VLRs along.
+    if src_crs is not None:
+        try:
             out_header.add_crs(src_crs)
-    except Exception as exc:
-        print(f"  (could not copy CRS, continuing without it: {exc})")
+        except Exception as exc:
+            print(f"  (could not copy CRS, continuing without it: {exc})")
 
-    out        = laspy.LasData(header=out_header)
-    out.points = las.points          # same point format -> record copies cleanly
-    out.z      = normalised_z
-    out.write(out_las_path)
+    written = 0
+    with laspy.open(a.input) as reader, \
+         laspy.open(str(out_las_path), mode='w', header=out_header) as writer:
+        for chunk in reader.chunk_iterator(CHUNK):
+            m = len(chunk.x)
+            chunk.z = normalised_z[written:written + m]
+            writer.write_points(chunk)
+            written += m
+            print(f"  ...wrote {written:,} / {n_points:,} points", flush=True)
+
+    if written != len(normalised_z):
+        sys.exit(f"ERROR: wrote {written:,} points but expected "
+                 f"{len(normalised_z):,}; the output is inconsistent.")
 
     # Read-back sanity check: confirm the point block on disk matches the header,
     # so a malformed or truncated write fails *here* with a clear message instead

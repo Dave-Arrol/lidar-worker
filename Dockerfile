@@ -44,7 +44,7 @@ ENV LD_LIBRARY_PATH=/opt/potree
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
-COPY index.js registry.js ./
+COPY index.js registry.js run-once.js ./
 COPY scripts ./scripts
 ENV PORT=8080
 EXPOSE 8080
