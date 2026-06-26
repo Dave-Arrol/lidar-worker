@@ -551,6 +551,41 @@ async function runAnalyses(cloudJobId, ids) {
     await streamDownload(RAW_BUCKET, job.raw_path, ctx.cloud)
   }
 
+  // Detect the cloud's real CRS once and thread it through every georeferenced
+  // stage (chm/dtm/slope/drainage/dbh/treetops/density/tariff all read ctx.crs).
+  // Stages previously assumed EPSG:27700, which mis-georeferences any cloud in a
+  // different grid (a UTM zone, another national grid, ...). A geographic
+  // (lat/lon, degrees) cloud cannot be ground-filtered in degrees, so we fail it
+  // with a clear message rather than emit silently-wrong output. A cloud with no
+  // declared CRS falls back to 27700 (the historical assumption) so clouds that
+  // worked before keep working.
+  ctx.crs = 'EPSG:27700'
+  try {
+    const out = (await run('python3', [path.join('/app/scripts', 'detect_crs.py'), ctx.cloud])).trim()
+    const detected = out.split('\n').pop().trim()   // last line only, defensively
+    if (detected === 'GEOGRAPHIC') {
+      const msg = 'cloud CRS is geographic (lat/lon, degrees); the analysis pipeline needs a ' +
+                  'projected metric CRS (e.g. a UTM zone or a national grid). Reproject the ' +
+                  'cloud to a projected CRS before upload.'
+      for (const id of planIds) {
+        await supabase.from('lidar_analyses').update({
+          status: 'failed', error: msg, updated_at: new Date().toISOString(),
+        }).eq('id', id)
+      }
+      throw new Error(msg)
+    } else if (/^EPSG:\d+$/.test(detected)) {
+      ctx.crs = detected
+      console.log('[analyse] cloud CRS detected:', ctx.crs)
+    } else {
+      console.log('[analyse] no usable CRS declared on cloud — assuming', ctx.crs)
+    }
+  } catch (e) {
+    // Propagate the geographic guard; otherwise tolerate a detector hiccup and
+    // keep the 27700 default so the run still proceeds.
+    if (String((e && e.message) || e).includes('geographic')) throw e
+    console.error('[analyse] CRS detection failed, assuming', ctx.crs, '-', errMsg(e).slice(0, 200))
+  }
+
   // Write the estate's compartment polygons into the workspace so the tariff stage can
   // refit a tariff per compartment (point-in-polygon). Best-effort: tariff.py falls back
   // to a single stand tariff if this file is empty or missing.

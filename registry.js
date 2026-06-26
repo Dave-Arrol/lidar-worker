@@ -37,7 +37,8 @@ const REGISTRY = [
     script: 'chm.py',
     args: (c) => ['--input', c.f('normalised.las'),
                   '--out-tif', c.f('chm.tif'),
-                  '--out-summary', c.f('chm_summary.json')],
+                  '--out-summary', c.f('chm_summary.json'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'raster',  file: 'chm.tif',          name: 'Canopy height', kind: 'chm' },
       { role: 'summary', file: 'chm_summary.json', name: 'summary' },
@@ -53,7 +54,8 @@ const REGISTRY = [
     args: (c) => ['--input', c.f('ground.csv'),
                   '--out-colour', c.f('dtm_colour.tif'),
                   '--out-hillshade', c.f('dtm_hillshade.tif'),
-                  '--out-summary', c.f('dtm_summary.json')],
+                  '--out-summary', c.f('dtm_summary.json'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'raster',  file: 'dtm_colour.tif',    name: 'DTM elevation', kind: 'dtm',       mode: 'terrain' },
       { role: 'raster',  file: 'dtm_hillshade.tif', name: 'DTM hillshade', kind: 'hillshade', mode: 'grey' },
@@ -68,7 +70,8 @@ const REGISTRY = [
     script: 'slope.py',
     args: (c) => ['--input', c.f('ground.csv'),
                   '--out-tif', c.f('slope.tif'),
-                  '--out-summary', c.f('slope_summary.json')],
+                  '--out-summary', c.f('slope_summary.json'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'raster',  file: 'slope.tif',          name: 'Slope', kind: 'slope', mode: 'slope' },
       { role: 'summary', file: 'slope_summary.json', name: 'summary' },
@@ -82,7 +85,8 @@ const REGISTRY = [
     script: 'drainage.py',
     args: (c) => ['--input', c.f('ground.csv'),
                   '--out-tif', c.f('drainage.tif'),
-                  '--out-summary', c.f('drainage_summary.json')],
+                  '--out-summary', c.f('drainage_summary.json'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'raster',  file: 'drainage.tif',          name: 'Drainage', kind: 'drainage', mode: 'water' },
       { role: 'summary', file: 'drainage_summary.json', name: 'summary' },
@@ -99,7 +103,8 @@ const REGISTRY = [
                   '--out-csv', c.f('treetops_std.csv'),
                   '--out-las', c.f('treetops_std.las'),
                   '--out-summary', c.f('treetops_std_summary.json'),
-                  '--out-geojson', c.f('treetops_std.geojson')],
+                  '--out-geojson', c.f('treetops_std.geojson'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'vector',  file: 'treetops_std.geojson',      name: 'Tree tops', kind: 'treetops' },
       { role: 'points',  file: 'treetops_std.las',          name: 'Tree tops (3D)' },
@@ -115,7 +120,8 @@ const REGISTRY = [
     script: 'tree_density.py',
     args: (c) => ['--input', c.f('treetops_std.csv'),
                   '--out-geojson', c.f('tree_density.geojson'),
-                  '--out-summary', c.f('tree_density_summary.json')],
+                  '--out-summary', c.f('tree_density_summary.json'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'vector',  file: 'tree_density.geojson',     name: 'Tree density', kind: 'density' },
       { role: 'summary', file: 'tree_density_summary.json', name: 'summary' },
@@ -153,7 +159,8 @@ const REGISTRY = [
                   '--out-models', c.f('taper_models.csv'),
                   '--out-las', c.f('dbh.las'),
                   '--out-summary', c.f('dbh_summary.json'),
-                  '--out-geojson', c.f('tree_dbh.geojson')],
+                  '--out-geojson', c.f('tree_dbh.geojson'),
+                  '--crs', c.crs],
     outputs: [
       { role: 'points',  file: 'dbh.las',         name: 'DBH ring fits' },
       { role: 'table',   file: 'results.csv',     name: 'DBH results' },
@@ -196,7 +203,7 @@ const REGISTRY = [
                   '--out-geojson', c.f('tree_volume.geojson'),
                   '--compartments', c.f('compartments.geojson'),
                   '--out-compartments', c.f('compartment_tariff.csv'),
-                  '--crs', 'EPSG:27700'],
+                  '--crs', c.crs],
     outputs: [
       { role: 'vector',  file: 'tree_volume.geojson',   kind: 'volume', name: 'Merch volume (per tree)' },
       { role: 'table',   file: 'tariff.csv',            name: 'Tariff & volume (per tree)' },

@@ -23,16 +23,25 @@ RUN apt-get update && apt-get install -y \
 RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
         | tar -xvj -C /usr/local bin/micromamba
 ENV MAMBA_ROOT_PREFIX=/opt/conda
+# Left unpinned intentionally: conda-forge versions aren't verifiable here, and a
+# wrong pin breaks the build. To freeze these too, run `micromamba list -p /opt/pdal`
+# inside a build you've confirmed works and pin pdal/untwine/awscli to those.
 RUN /usr/local/bin/micromamba create -y -p /opt/pdal -c conda-forge pdal untwine awscli \
     && /usr/local/bin/micromamba clean -a -y
 ENV PATH=$PATH:/opt/pdal/bin
 
 # Python analysis libraries (CSF = cloth-simulation-filter ground filter)
 # Full algorithmic-pipeline stack (segmentation needs scikit-image; dbh/stem need
-# scikit-learn + pandas; plots need matplotlib, headless via MPLBACKEND=Agg)
+# scikit-learn + pandas; plots need matplotlib, headless via MPLBACKEND=Agg).
+# Versions are PINNED so rebuilds are reproducible: an unpinned build silently
+# tracks "latest", which is how a rebuild can change behaviour (e.g. a numpy 2 /
+# pandas 3 major bump, or a new lazrs LAZ backend) without any code change. This
+# is a coherent numpy-1.x set; lazrs is pinned inside laspy 2.7.0's >=0.8,<0.9
+# requirement.
 RUN pip3 install --no-cache-dir \
-    "laspy[lazrs]==2.7.0" cloth-simulation-filter==1.1.7 \
-    numpy scipy scikit-image scikit-learn pandas matplotlib rasterio
+    "laspy[lazrs]==2.7.0" lazrs==0.8.1 cloth-simulation-filter==1.1.7 \
+    numpy==1.26.4 scipy==1.13.1 scikit-image==0.24.0 scikit-learn==1.5.2 \
+    pandas==2.2.3 matplotlib==3.9.2 rasterio==1.3.11
 ENV MPLBACKEND=Agg
 
 # PotreeConverter (binary + its shared libs) — worker calls it by absolute path.
