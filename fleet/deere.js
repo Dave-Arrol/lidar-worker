@@ -80,16 +80,37 @@ async function getValidConnection(supabase) {
   return { conn, token: t.access_token }
 }
 
-/** HATEOAS-first equipment list for an organisation. */
+/**
+ * Equipment list for an organisation. HATEOAS-first, but resilient: JD orgs can
+ * expose both a legacy platform 'machines' link and a newer 'equipment' link
+ * (isg/equipment host), and production enablement does not always cover both.
+ * Try each candidate in order and use the first that answers.
+ */
 async function listMachines(token, orgId) {
-  let url = `${API_BASE}/organizations/${orgId}/machines`
+  const candidates = []
   try {
     const org = await jdGet(token, `${API_BASE}/organizations/${orgId}`)
-    const link = ((org && org.links) || []).find(l => l.rel === 'machines' || l.rel === 'equipment')
-    if (link && link.uri) url = link.uri
-  } catch { /* fall back to the constructed URL */ }
-  const data = await jdGet(token, url)
-  return data.values || []
+    const links = (org && org.links) || []
+    for (const rel of ['machines', 'equipment']) {
+      const l = links.find(x => x.rel === rel)
+      if (l && l.uri) candidates.push(l.uri)
+    }
+  } catch { /* org fetch failed; constructed URLs below still apply */ }
+  candidates.push(`${API_BASE}/organizations/${orgId}/machines`)
+  candidates.push(`${API_BASE}/organizations/${orgId}/equipment`)
+
+  let lastErr = null
+  for (const url of [...new Set(candidates)]) {
+    try {
+      const data = await jdGet(token, url)
+      console.log(`[deere] equipment endpoint OK: ${url.replace(/\?.*$/, '')}`)
+      return data.values || []
+    } catch (e) {
+      console.warn(`[deere] endpoint failed, trying next: ${String(e.message).slice(0, 160)}`)
+      lastErr = e
+    }
+  }
+  throw lastErr || new Error('no equipment endpoint available')
 }
 
 /** Latest location for one machine, or null. */
