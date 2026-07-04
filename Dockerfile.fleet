@@ -1,0 +1,22 @@
+# Dockerfile.fleet — slim Node-only image for the Arrol fleet sync.
+#
+# Deliberately separate from the main worker image: the LiDAR image carries a
+# multi-gigabyte geospatial stack (PDAL, GDAL, conda) that a 15-minute poll job
+# should never pull. This one is ~150 MB and cold-starts in seconds.
+#
+# Build + push (from the worker repo root):
+#   aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin 994114819090.dkr.ecr.eu-west-2.amazonaws.com
+#   docker build -f Dockerfile.fleet -t arrol-fleet-sync .
+#   docker tag arrol-fleet-sync:latest 994114819090.dkr.ecr.eu-west-2.amazonaws.com/arrol-fleet-sync:latest
+#   docker push 994114819090.dkr.ecr.eu-west-2.amazonaws.com/arrol-fleet-sync:latest
+
+FROM node:22-slim
+
+WORKDIR /app
+
+COPY fleet/package*.json ./
+RUN npm install --omit=dev && npm cache clean --force
+
+COPY fleet/ ./
+
+CMD ["node", "sync.js"]
