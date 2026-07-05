@@ -1,25 +1,38 @@
-// sync.js — Arrol fleet sync. Runs once and exits (AWS Batch job; also submitted
-// on demand by the portal's "Sync now"). One process, one pass per vendor:
+// sync.js — Arrol fleet sync (Phase B: connection-driven, staged import).
 //
-//   Komatsu — list new HPR/MOM/FPR files in the window since the last successful
-//   run, download each, archive the raw XML to S3 (machine-files/), register the
-//   machine, ledger the file in machine_files, parse HPR into harvested_stems
-//   with automatic site + operation matching, and record a fleet_sync_runs row.
+// One AWS Batch job definition, two modes, routed by env:
 //
-//   Deere — refresh the stored OAuth connection, list the organisation's
-//   equipment, record latest positions into machine_positions and update the
-//   machine registry.
+//   CONNECTION_ID set   -> sync that one machine_connections row. Credentials
+//                          are resolved from Secrets Manager at runtime; the
+//                          row's options control file types, backfill window
+//                          and import mode.
 //
-// Idempotency: machine_files.file_name is UNIQUE — a file is fetched and parsed
-// exactly once. Re-parsing (if ever needed) deletes stems by source_file first.
-// A vendor failing records its error but does not abort the other vendor.
+//   CONNECTION_ID unset -> dispatcher tick (dispatch.js): submit one
+//                          per-connection job for every active connection whose
+//                          next_run_at has arrived. This is what the 15-minute
+//                          EventBridge schedule runs, so the schedule itself
+//                          never changes — pause and frequency live in the DB.
 //
-// Env (see fleet-setup.ps1 for how these reach the Batch job definition):
+// Import modes (connection options.import_mode):
+//   staged (default) — files are archived, ledgered and parsed immediately,
+//     but site routing comes ONLY from feed_objects mapping rules. Objects
+//     with a 'linked' rule flow straight to their site + operation; 'ignored'
+//     objects ingest silently unassigned; anything else lands 'pending' in the
+//     portal inbox with live rollups (stems inserted with site_id null so the
+//     drill-down works before the user has placed the object).
+//   auto — the Phase A behaviour: name/GPS site matching, then auto site
+//     creation; the result is recorded as a 'linked' feed object so it also
+//     becomes a mapping rule.
+//
+// Idempotency: machine_files.file_name is UNIQUE — a file is fetched and
+// parsed exactly once. Re-parsing deletes stems by source_file first.
+//
+// Env (see the Phase B setup steps):
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY        (required)
 //   S3_BUCKET (default arrol-lidar), AWS_REGION (default eu-west-2)
-//   KOMATSU_API_KEY, KOMATSU_API_BASE, KOMATSU_BACKFILL_DAYS (default 14)
-//   DEERE_CLIENT_ID, DEERE_CLIENT_SECRET, DEERE_OAUTH_BASE, DEERE_API_BASE
-//   SYNC_VENDORS (default "komatsu,deere" — limit for testing, e.g. "komatsu")
+//   CONNECTION_ID (per-connection jobs, set by the dispatcher)
+//   FLEET_FORCE=1 (dispatcher mode: treat all active connections as due)
+//   KOMATSU_API_BASE, DEERE_* (bases + Deere app credentials, from job def)
 
 'use strict'
 
@@ -30,12 +43,12 @@ const { parseHpr, stemsToHarvestRows } = require('./hpr')
 const { loadLeafSites, resolveSite } = require('./sitematch')
 const { autoCreateSite } = require('./autosite')
 const deere = require('./deere')
+const { loadConnections, resolveCredential, recordRunResult } = require('./connections')
+const { loadFeedObjects, ensureFeedObject, applyFileRollups, normKey } = require('./feedobjects')
+const { runDispatch } = require('./dispatch')
 
 const S3_BUCKET = process.env.S3_BUCKET || 'arrol-lidar'
 const AWS_REGION = process.env.AWS_REGION || 'eu-west-2'
-const BACKFILL_DAYS = parseInt(process.env.KOMATSU_BACKFILL_DAYS || '14', 10)
-const VENDORS = (process.env.SYNC_VENDORS || 'komatsu,deere').split(',').map(s => s.trim()).filter(Boolean)
-const AUTO_CREATE_SITES = (process.env.FLEET_AUTO_CREATE_SITES || 'true') !== 'false'
 
 function supabaseAdmin() {
   const url = process.env.SUPABASE_URL
@@ -93,9 +106,9 @@ async function ensureMachine(supabase, vendor, vendorMachineId, fields) {
 }
 
 // ── Sync-run bookkeeping ──────────────────────────────────────────────────────
-async function startRun(supabase, vendor) {
+async function startRun(supabase, vendor, connectionId) {
   const { data, error } = await supabase.from('fleet_sync_runs')
-    .insert({ vendor }).select('id,started_at').single()
+    .insert({ vendor, connection_id: connectionId || null }).select('id,started_at').single()
   if (error) throw new Error('fleet_sync_runs insert failed: ' + error.message)
   return data
 }
@@ -105,7 +118,16 @@ async function finishRun(supabase, id, patch) {
     .update({ ...patch, finished_at: new Date().toISOString() }).eq('id', id)
 }
 
-async function lastGoodRunStart(supabase, vendor) {
+// Window anchor: this connection's last good run, falling back to the vendor's
+// (pre-Phase-B runs have no connection_id), so the migration never re-lists
+// the whole backfill window.
+async function lastGoodRunStart(supabase, vendor, connectionId) {
+  if (connectionId) {
+    const { data } = await supabase.from('fleet_sync_runs')
+      .select('started_at').eq('connection_id', connectionId).eq('ok', true)
+      .order('started_at', { ascending: false }).limit(1).maybeSingle()
+    if (data) return new Date(data.started_at)
+  }
   const { data } = await supabase.from('fleet_sync_runs')
     .select('started_at').eq('vendor', vendor).eq('ok', true)
     .order('started_at', { ascending: false }).limit(1).maybeSingle()
@@ -113,24 +135,29 @@ async function lastGoodRunStart(supabase, vendor) {
 }
 
 // ── Komatsu pass ──────────────────────────────────────────────────────────────
-async function runKomatsu(supabase) {
-  const run = await startRun(supabase, 'komatsu')
+async function runKomatsu(supabase, conn) {
+  const run = await startRun(supabase, 'komatsu', conn.id)
   const counters = { files_found: 0, files_ingested: 0, stems_inserted: 0, machines_seen: 0 }
   const detail = { files: [] }
-  try {
-    if (!process.env.KOMATSU_API_KEY) throw new Error('KOMATSU_API_KEY not configured')
+  const options = conn.options || {}
+  const fileTypes = Array.isArray(options.file_types) && options.file_types.length
+    ? options.file_types.map(t => String(t).toLowerCase())
+    : ['hpr', 'mom', 'fpr']
+  const backfillDays = parseInt(options.backfill_days, 10) || 14
+  const importMode = options.import_mode === 'auto' ? 'auto' : 'staged'
 
-    // Window: last good run minus a 1h overlap; first run backfills BACKFILL_DAYS.
-    const last = await lastGoodRunStart(supabase, 'komatsu')
+  try {
+    // Window: last good run minus a 1h overlap; first run backfills backfillDays.
+    const last = await lastGoodRunStart(supabase, 'komatsu', conn.id)
     const start = last
       ? new Date(last.getTime() - 60 * 60 * 1000)
-      : new Date(Date.now() - BACKFILL_DAYS * 24 * 60 * 60 * 1000)
+      : new Date(Date.now() - backfillDays * 24 * 60 * 60 * 1000)
     const end = new Date()
-    console.log(`[komatsu] window ${start.toISOString()} -> ${end.toISOString()}`)
+    console.log(`[komatsu] "${conn.label}" mode=${importMode} window ${start.toISOString()} -> ${end.toISOString()}`)
 
-    // List all three production file types across all machines on the key.
+    // List the connection's enabled file types across all machines on the key.
     const listed = [] // { type, name }
-    for (const type of ['hpr', 'mom', 'fpr']) {
+    for (const type of fileTypes) {
       try {
         const names = await komatsu.listFiles(type, start, end)
         for (const name of names) listed.push({ type, name })
@@ -153,12 +180,15 @@ async function runKomatsu(supabase) {
     const fresh = listed.filter(f => !known.has(f.name))
     console.log(`[komatsu] ${fresh.length} new file(s) to ingest`)
 
-    // Sites loaded once per run for matching.
-    const sites = fresh.some(f => f.type === 'hpr') ? await loadLeafSites(supabase) : []
+    const hasHpr = fresh.some(f => f.type === 'hpr')
+    // Mapping rules always load; leaf sites only matter in auto mode.
+    const feedObjects = hasHpr ? await loadFeedObjects(supabase) : new Map()
+    const sites = hasHpr && importMode === 'auto' ? await loadLeafSites(supabase) : []
 
     for (const f of fresh) {
       try {
-        const ingested = await ingestKomatsuFile(supabase, f.type, f.name, sites, counters)
+        const ingested = await ingestKomatsuFile(supabase, conn, importMode, f.type, f.name,
+          feedObjects, sites, counters)
         detail.files.push(ingested)
       } catch (e) {
         console.error(`[komatsu] ingest ${f.name} failed:`, e.message)
@@ -181,13 +211,15 @@ async function runKomatsu(supabase) {
 
     await finishRun(supabase, run.id, { ok: true, ...counters, detail })
     console.log(`[komatsu] done: ${counters.files_ingested}/${counters.files_found} files, ${counters.stems_inserted} stems`)
+    return { ok: true }
   } catch (e) {
     console.error('[komatsu] run failed:', e.message)
     await finishRun(supabase, run.id, { ok: false, ...counters, error: String(e.message).slice(0, 500), detail })
+    return { ok: false, error: e.message }
   }
 }
 
-async function ingestKomatsuFile(supabase, type, name, sites, counters) {
+async function ingestKomatsuFile(supabase, conn, importMode, type, name, feedObjects, sites, counters) {
   const { chassis, timestamp } = komatsu.parseFileName(name)
   const bytes = await komatsu.getFile(type, name)
   const s3Key = `machine-files/komatsu/${type}/${name}`
@@ -206,6 +238,7 @@ async function ingestKomatsuFile(supabase, type, name, sites, counters) {
     s3_key: s3Key,
     size_bytes: bytes.length,
     file_date: timestamp,
+    connection_id: conn.id,
   }).select('id').single()
   if (fileErr) {
     // UNIQUE collision = another run beat us to it; treat as already ingested.
@@ -226,18 +259,56 @@ async function ingestKomatsuFile(supabase, type, name, sites, counters) {
       return result
     }
 
-    let { siteId, operationId, matchedBy } = await resolveSite(supabase, parsed, sites)
+    // ── Site routing ─────────────────────────────────────────────────────────
+    // Mapping rules first, in every mode. Then, only in auto mode, the Phase A
+    // name/GPS matching and auto site creation. Staged mode never guesses: an
+    // unmapped object lands 'pending' in the inbox and its stems stay
+    // unassigned until the user decides.
+    let siteId = null
+    let operationId = null
+    let matchedBy = ''
+    let feedObj = null
+    const objectKey = normKey(parsed.objectName)
 
-    // No match, but the machine named its harvest object: provision the site
-    // from the feed (approximate boundary derived from stem GPS). The new site
-    // joins this run's match list, so the object's later files match by name.
-    if (!siteId && AUTO_CREATE_SITES && parsed.objectName) {
-      const created = await autoCreateSite(supabase, parsed.objectName, parsed.stems,
-        'komatsu', parsed.machineId || parsed.machineName)
-      if (created) {
-        sites.push(created)
-        siteId = created.id
-        matchedBy = 'auto_created'
+    if (!objectKey) {
+      matchedBy = 'no_object_name'
+    } else {
+      feedObj = feedObjects.get(objectKey) || null
+      if (feedObj && feedObj.status === 'linked') {
+        siteId = feedObj.site_id
+        operationId = feedObj.operation_id
+        matchedBy = 'mapping_rule'
+      } else if (feedObj && feedObj.status === 'ignored') {
+        matchedBy = 'ignored'
+      } else if (importMode === 'auto') {
+        ;({ siteId, operationId, matchedBy } = await resolveSite(supabase, parsed, sites))
+        if (!siteId && parsed.objectName) {
+          const created = await autoCreateSite(supabase, parsed.objectName, parsed.stems,
+            'komatsu', parsed.machineId || parsed.machineName)
+          if (created) {
+            sites.push(created)
+            siteId = created.id
+            matchedBy = 'auto_created'
+          }
+        }
+        // Record the outcome as a rule so future files route without matching.
+        feedObj = await ensureFeedObject(supabase, feedObjects, parsed.objectName, 'komatsu', {
+          status: siteId ? 'linked' : 'pending',
+          site_id: siteId,
+          operation_id: operationId || null,
+        })
+        // The object may pre-exist as 'pending'; a fresh auto match links it.
+        if (feedObj && siteId && feedObj.status !== 'linked') {
+          await supabase.from('feed_objects').update({
+            status: 'linked', site_id: siteId, operation_id: operationId || null,
+            decided_at: new Date().toISOString(), decided_by: 'auto',
+            updated_at: new Date().toISOString(),
+          }).eq('id', feedObj.id)
+          Object.assign(feedObj, { status: 'linked', site_id: siteId, operation_id: operationId || null })
+        }
+      } else {
+        matchedBy = 'staged'
+        feedObj = await ensureFeedObject(supabase, feedObjects, parsed.objectName, 'komatsu', null)
       }
     }
 
@@ -262,11 +333,17 @@ async function ingestKomatsuFile(supabase, type, name, sites, counters) {
     }
     await supabase.from('machine_files').update({
       parse_status: 'parsed', site_id: siteId, operation_id: operationId, summary,
+      feed_object_id: feedObj ? feedObj.id : null,
     }).eq('id', fileRow.id)
     Object.assign(result, summary)
+
+    // Live inbox rollups: counters, date range, machines, merged GPS hull.
+    if (feedObj) {
+      await applyFileRollups(supabase, feedObj, parsed, chassis || parsed.machineId, timestamp)
+    }
   } else {
     // MOM (utilisation) and FPR (forwarded production) are archived now and
-    // parsed in the next phase — the raw XML is safe in S3 either way.
+    // parsed in a later phase — the raw XML is safe in S3 either way.
     await supabase.from('machine_files').update({ parse_status: 'stored' }).eq('id', fileRow.id)
     result.parse = 'stored'
   }
@@ -285,25 +362,25 @@ async function ingestKomatsuFile(supabase, type, name, sites, counters) {
 }
 
 // ── Deere pass ────────────────────────────────────────────────────────────────
-async function runDeere(supabase) {
-  const run = await startRun(supabase, 'deere')
+async function runDeere(supabase, conn) {
+  const run = await startRun(supabase, 'deere', conn.id)
   const counters = { machines_seen: 0, positions_recorded: 0 }
   try {
     const valid = await deere.getValidConnection(supabase)
     if (!valid) {
       await finishRun(supabase, run.id, { ok: true, ...counters, detail: { note: 'no deere connection' } })
-      console.log('[deere] no connection stored — skipping (connect in the portal first)')
-      return
+      console.log('[deere] no OAuth connection stored — skipping (connect in the portal first)')
+      return { ok: true }
     }
-    const { conn, token } = valid
-    if (!conn.jd_org_id) {
+    const { conn: oauth, token } = valid
+    if (!oauth.jd_org_id) {
       await finishRun(supabase, run.id, { ok: true, ...counters, detail: { note: 'connection has no org' } })
-      return
+      return { ok: true }
     }
 
-    const jdMachines = await deere.listMachines(token, conn.jd_org_id)
+    const jdMachines = await deere.listMachines(token, oauth.jd_org_id)
     counters.machines_seen = jdMachines.length
-    console.log(`[deere] ${jdMachines.length} machine(s) in org ${conn.jd_org_id}`)
+    console.log(`[deere] ${jdMachines.length} machine(s) in org ${oauth.jd_org_id}`)
 
     for (const m of jdMachines) {
       const machine = await ensureMachine(supabase, 'deere', m.id, {
@@ -334,19 +411,54 @@ async function runDeere(supabase) {
 
     await finishRun(supabase, run.id, { ok: true, ...counters, detail: {} })
     console.log(`[deere] done: ${counters.positions_recorded} position(s) recorded`)
+    return { ok: true }
   } catch (e) {
     console.error('[deere] run failed:', e.message)
     await finishRun(supabase, run.id, { ok: false, ...counters, error: String(e.message).slice(0, 500) })
+    return { ok: false, error: e.message }
   }
+}
+
+// ── Per-connection run ────────────────────────────────────────────────────────
+async function runConnection(supabase, conn) {
+  console.log(`[fleet] connection ${conn.id} — ${conn.vendor} "${conn.label}" (${conn.status})`)
+  let outcome = { ok: false, error: 'unknown vendor' }
+  try {
+    if (conn.vendor === 'komatsu') {
+      const key = await resolveCredential(conn)
+      if (!key) throw new Error('no credential resolved for komatsu connection')
+      process.env.KOMATSU_API_KEY = key
+      outcome = await runKomatsu(supabase, conn)
+    } else if (conn.vendor === 'deere') {
+      // Deere app credentials arrive via the job definition env; the OAuth
+      // token lives in deere_connections. The row here governs scheduling.
+      outcome = await runDeere(supabase, conn)
+    }
+  } catch (e) {
+    outcome = { ok: false, error: e.message }
+    console.error(`[fleet] connection ${conn.id} failed:`, e.message)
+  }
+  await recordRunResult(supabase, conn.id, outcome.ok, outcome.error)
+  return outcome
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log(`[fleet] sync starting — vendors: ${VENDORS.join(', ')}`)
   const supabase = supabaseAdmin()
-  if (VENDORS.includes('komatsu')) await runKomatsu(supabase)
-  if (VENDORS.includes('deere')) await runDeere(supabase)
-  console.log('[fleet] sync complete')
+  const connectionId = process.env.CONNECTION_ID
+
+  if (connectionId) {
+    // Targeted run (paused rows included — explicit targeting is deliberate,
+    // e.g. testing the Deere connection while it stays paused for the tick).
+    const rows = await loadConnections(supabase, { id: connectionId })
+    if (!rows.length) throw new Error(`connection ${connectionId} not found`)
+    await runConnection(supabase, rows[0])
+    console.log('[fleet] sync complete')
+    return
+  }
+
+  console.log('[fleet] no CONNECTION_ID — running dispatcher tick')
+  await runDispatch(supabase)
 }
 
 main().then(

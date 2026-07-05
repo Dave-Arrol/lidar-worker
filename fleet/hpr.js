@@ -149,7 +149,10 @@ function parseHpr(xml, fileName) {
 
 // ── Map parsed stems to harvested_stems insert rows ───────────────────────────
 // Mirrors lib/hpr.ts stemsToHarvestRows, extended for the machine feed:
-// operation_id may be null, and vendor / machine_file_id carry provenance.
+// operation_id may be null, vendor / machine_file_id carry provenance, and each
+// row stores the full taper profile plus per-log detail (start position, butt
+// and top diameters) so the portal can draw stem profiles and grade log
+// quality without re-reading the source XML.
 function stemsToHarvestRows(data, opts) {
   const { operationId, siteId, machineFileId, vendor, felledAtIso } = opts
   const felled = felledAtIso || (data.startDate ? `${data.startDate}T12:00:00Z` : null)
@@ -169,10 +172,15 @@ function stemsToHarvestRows(data, opts) {
       volume_ub_m3: null,
       assortment: primary,
       logs: s.logs.map(l => ({
+        log_key: l.logKey || '',
         assortment: l.product,
+        start_cm: Math.round(l.startM * 100),
         length_cm: Math.round(l.lengthM * 100),
+        diam_butt_mm: l.diamButtMM ? Math.round(l.diamButtMM) : null,
+        diam_top_mm: l.diamTopMM ? Math.round(l.diamTopMM) : null,
         volume_m3: Math.round(l.volumeM3 * 1000) / 1000,
       })),
+      taper: s.taper.map(t => ({ pos_cm: Math.round(t.posM * 100), diam_mm: Math.round(t.diamMM) })),
       longitude: s.lon,
       latitude: s.lat,
       machine: data.machineId || data.machineName || '',

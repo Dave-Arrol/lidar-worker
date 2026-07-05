@@ -71,6 +71,26 @@ function boundaryFromStems(stems) {
   return { type: 'Polygon', coordinates: [ring] }
 }
 
+/**
+ * Pure (unbuffered) convex hull of lat/lon points as a GeoJSON Polygon, or
+ * null with fewer than 3 usable points. feed_objects.hull stores THIS —
+ * buffering is applied only when a site boundary is derived from it, so
+ * repeated hull merges never inflate the shape.
+ */
+function hullFromLatLon(points) {
+  const pts = (points || []).filter(p => p && p.lat != null && p.lon != null)
+  if (pts.length < 3) return null
+  const c = centroidOf(pts)
+  const mPerDegLat = 111320
+  const mPerDegLon = 111320 * Math.cos(c.lat * Math.PI / 180)
+  const xy = pts.map(p => [(p.lon - c.lon) * mPerDegLon, (p.lat - c.lat) * mPerDegLat])
+  const hull = convexHull(xy)
+  if (hull.length < 3) return null
+  const ring = hull.map(([x, y]) => [c.lon + x / mPerDegLon, c.lat + y / mPerDegLat])
+  ring.push(ring[0])
+  return { type: 'Polygon', coordinates: [ring] }
+}
+
 // ── Supabase provisioning ─────────────────────────────────────────────────────
 let feedEstateId = null
 
@@ -129,4 +149,4 @@ async function autoCreateSite(supabase, objectName, stems, vendor, machineLabel)
   return created
 }
 
-module.exports = { autoCreateSite, ensureFeedEstate, boundaryFromStems }
+module.exports = { autoCreateSite, ensureFeedEstate, boundaryFromStems, hullFromLatLon }
