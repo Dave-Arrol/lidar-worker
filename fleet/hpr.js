@@ -28,6 +28,19 @@ function numChild(parent, tag) {
   return parseFloat(childText(parent, tag) || '0') || 0
 }
 
+// LogVolume with category preference: JD TimberMatic writes several volumes
+// per log (m3 (price), m3sob, m3sub); Komatsu writes one uncategorised value.
+// m3sob (solid over bark) matches harvested_stems volume_ob semantics.
+function logVolume(logEl) {
+  const els = getEls(logEl, 'LogVolume')
+  if (!els.length) return 0
+  for (const cat of ['m3sob', 'm3 (price)', 'm3sub']) {
+    const el = els.find(e => e.getAttribute('logVolumeCategory') === cat)
+    if (el) return parseFloat(el.textContent || '0') || 0
+  }
+  return parseFloat(els[0].textContent || '0') || 0
+}
+
 function logDiam(logEl, cat) {
   const el = getEls(logEl, 'LogDiameter').find(e => e.getAttribute('logDiameterCategory') === cat)
   return parseFloat((el && el.textContent) || '0') || 0
@@ -50,6 +63,7 @@ function coordsFrom(el) {
 // ── Parser ────────────────────────────────────────────────────────────────────
 function parseHpr(xml, fileName) {
   try {
+    xml = String(xml).replace(/^\uFEFF/, '')
     let fatal = null
     const doc = new DOMParser({
       onError: (level, msg) => { if (level === 'fatalError') fatal = msg },
@@ -60,8 +74,8 @@ function parseHpr(xml, fileName) {
     const machineId   = childText(root, 'MachineUserID')
     const machineName = childText(root, 'MachineBaseModel') || childText(root, 'MachineBaseManufacturer')
     const objectName  = childText(root, 'ObjectName')
-    const startDate   = (childText(root, 'StartTime') || childText(root, 'HarvestDate')).slice(0, 10)
-    const endDate     = (childText(root, 'StopTime') || '').slice(0, 10)
+    const startDate   = (childText(root, 'StartTime') || childText(root, 'HarvestDate') || childText(root, 'StartDate')).slice(0, 10)
+    const endDate     = (childText(root, 'StopTime') || childText(root, 'EndDate') || '').slice(0, 10)
 
     const speciesMap = {}
     getEls(root, 'SpeciesGroupDefinition').forEach(el => {
@@ -108,8 +122,8 @@ function parseHpr(xml, fileName) {
 
       const logEls = stpEl ? getEls(stpEl, 'Log') : getEls(stemEl, 'Log')
       const logs = logEls.map(lEl => {
-        const volEl = getEls(lEl, 'LogVolume')[0]
-        const vol = parseFloat((volEl && volEl.textContent) || '0') || 0
+        const vol = logVolume(lEl)
+        const startRaw = childText(lEl, 'StartPos')
 
         let logLat = null, logLon = null
         const lcEl = getEls(lEl, 'LogCoordinates')[0]
@@ -118,7 +132,7 @@ function parseHpr(xml, fileName) {
         return {
           logKey:     childText(lEl, 'LogKey'),
           product:    productMap[childText(lEl, 'ProductKey')] || childText(lEl, 'ProductKey'),
-          startM:     numChild(lEl, 'StartPos') / 100,
+          startM:     startRaw ? parseFloat(startRaw) / 100 : null,
           lengthM:    numChild(lEl, 'LogLength') / 100,
           diamButtMM: logDiam(lEl, 'Butt ob') || logDiam(lEl, 'Butt ub'),
           diamTopMM:  logDiam(lEl, 'Top ob') || logDiam(lEl, 'Top ub'),
@@ -128,11 +142,22 @@ function parseHpr(xml, fileName) {
         }
       })
 
+      // JD TimberMatic omits StartPos — rebuild cumulative positions so the
+      // cut plan and profile still stack correctly (explicit positions kept).
+      let cursorM = 0
+      for (const l of logs) {
+        if (l.startM == null) l.startM = cursorM
+        cursorM = l.startM + l.lengthM
+      }
+      const stemHeightM = heightM || cursorM
+
       const stemVol = logs.reduce((a, l) => a + l.volumeM3, 0)
 
       return {
-        stemKey: childText(stemEl, 'StemKey'), species, speciesCode,
-        dbhMM, heightM, volumeM3: stemVol, lat, lon, logs, taper,
+        stemKey: childText(stemEl, 'StemKey'),
+        stemNumber: childText(stemEl, 'StemNumber') || childText(stemEl, 'StemKey'),
+        species, speciesCode,
+        dbhMM, heightM: stemHeightM, volumeM3: stemVol, lat, lon, logs, taper,
       }
     })
 
@@ -164,7 +189,7 @@ function stemsToHarvestRows(data, opts) {
     return {
       operation_id: operationId || null,
       site_id: siteId || null,
-      stem_number: parseInt(s.stemKey, 10) || null,
+      stem_number: parseInt(s.stemNumber || s.stemKey, 10) || null,
       species: s.species || '',
       dbh_mm: s.dbhMM ? Math.round(s.dbhMM) : null,
       length_dm: s.heightM ? Math.round(s.heightM * 10) : null,
