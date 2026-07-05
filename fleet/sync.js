@@ -44,6 +44,7 @@ const { loadLeafSites, resolveSite } = require('./sitematch')
 const { autoCreateSite } = require('./autosite')
 const deere = require('./deere')
 const { loadConnections, resolveCredential, recordRunResult } = require('./connections')
+const { runEmail } = require('./email')
 const { loadFeedObjects, ensureFeedObject, applyFileRollups, normKey } = require('./feedobjects')
 const { runDispatch } = require('./dispatch')
 
@@ -433,6 +434,10 @@ async function runConnection(supabase, conn) {
       // Deere app credentials arrive via the job definition env; the OAuth
       // token lives in deere_connections. The row here governs scheduling.
       outcome = await runDeere(supabase, conn)
+    } else if (conn.vendor === 'email') {
+      // The StanForD email bridge — no credentials; the connection's inbox
+      // token identifies its mail in the SES drop prefix.
+      outcome = await runEmail(supabase, conn, startRun, finishRun)
     }
   } catch (e) {
     outcome = { ok: false, error: e.message }
