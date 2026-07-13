@@ -586,6 +586,42 @@ async function runAnalyses(cloudJobId, ids) {
     console.error('[analyse] CRS detection failed, assuming', ctx.crs, '-', errMsg(e).slice(0, 200))
   }
 
+  // Preflight: crop the cloud to its dominant dense cluster before any stage runs.
+  // Merged DJI exports can carry stray blocks / outlier points hundreds of km from
+  // the site (one cloud spanned 588 km), and CSF in normalise builds its cloth grid
+  // over the FULL extent - a runaway bbox means a ~1e12-cell allocation and a C++
+  // std::length_error minutes into the run. crop_to_site.py streams two passes:
+  // pass 1 finds the dominant density cluster, pass 2 writes only its points
+  // (+50 m buffer), reporting every stray cluster it discards. If the header bbox
+  // is already sane (<5 km) it passes the cloud through untouched. A non-zero exit
+  // means the cloud is unrecoverable (still >10 km after cropping, or no dense
+  // cluster at all) - fail the whole plan with a clear message up front.
+  try {
+    const cropped = ctx.f('cloud_cropped' + ext)
+    const cropOut = await run('python3', [path.join('/app/scripts', 'crop_to_site.py'), '--input', ctx.cloud, '--output', cropped])
+    let info = {}
+    try { info = JSON.parse(cropOut.trim().split('\n').pop()) } catch (_) { /* log-only: treat as passthrough */ }
+    if (info.cropped) {
+      console.log('[analyse] preflight crop: kept', info.kept, '/', info.total, 'points',
+        '(' + Math.round((info.kept_fraction || 0) * 1000) / 10 + '%),',
+        'discarded', info.discarded_clusters, 'stray cluster(s)')
+      await fsp.rm(ctx.cloud, { force: true })   // raw copy no longer needed - free ephemeral disk
+      ctx.cloud = cropped
+    } else {
+      await fsp.rm(cropped, { force: true })     // sane bbox: keep the original, drop the passthrough copy
+      console.log('[analyse] preflight crop: extent already sane, no crop applied')
+    }
+  } catch (e) {
+    const msg = 'preflight crop failed: cloud extent is unusable (stray clusters or a degenerate ' +
+                'bbox beyond recovery) - inspect the source LAZ. ' + errMsg(e).slice(0, 300)
+    for (const id of planIds) {
+      await supabase.from('lidar_analyses').update({
+        status: 'failed', error: msg, updated_at: new Date().toISOString(),
+      }).eq('id', id)
+    }
+    throw new Error(msg)
+  }
+
   // Write the estate's compartment polygons into the workspace so the tariff stage can
   // refit a tariff per compartment (point-in-polygon). Best-effort: tariff.py falls back
   // to a single stand tariff if this file is empty or missing.
