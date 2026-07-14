@@ -35,6 +35,19 @@ values exactly matching its header; a whole-file read does not). The write is
 chunked for the same reason, replacing only Z per chunk with the normalised
 height. out_header scales/offsets MUST match the source so each chunk's existing
 integer X/Y decode identically on read-back.
+
+CSF 32-bit ceiling
+------------------
+The CSF binding's C++ side indexes with 32-bit ints. Past ~715.8M points
+(2^31 / 3 coordinate values) the arithmetic wraps: coordinates scramble
+between axes, the computed bbox explodes to hundreds of km, and the cloth
+grid allocation throws std::length_error (observed on a clean 1.1e9-point
+cloud whose true extent was 1.7 km). Ground classification gains nothing
+from hundreds of points/m^2, so clouds above --csf-max-points are stride-
+subsampled FOR CSF ONLY: ground is classified on the subset, then the FULL
+cloud is height-normalised against that ground surface. Every point is
+preserved in the output — segmentation and DBH ring-fitting downstream see
+full density. Clouds under the ceiling behave byte-identically to before.
 """
 
 import argparse
@@ -43,6 +56,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import laspy
 import CSF
 from scipy.spatial import cKDTree
@@ -80,6 +94,15 @@ def parse_args():
     ap.add_argument('--threshold',  type=float, default=0.5,
                     help='Max distance (m) from cloth for a point to be ground. '
                          'Default 0.5.')
+
+    # ── CSF input ceiling (32-bit guard) ───────────────────────
+    ap.add_argument('--csf-max-points', type=int, default=400_000_000,
+                    help='Max points fed to CSF. The CSF C++ core wraps 32-bit '
+                         'indices past ~715.8M points, scrambling coordinates; '
+                         'larger clouds are stride-subsampled for ground '
+                         'classification only. The full cloud is still height-'
+                         'normalised and written out. Default 400M (safety '
+                         'margin under the 2^31/3 hard ceiling).')
 
     # ── Ground CSV grid resolution (default = original SETTINGS) ──
     ap.add_argument('--grid',       type=float, default=0.5,
@@ -131,6 +154,23 @@ def main():
     print(f"Z range before normalisation: "
           f"{points[:, 2].min():.2f} -> {points[:, 2].max():.2f}")
 
+    # ── CSF INPUT GUARD (32-bit ceiling) ───────────────────────
+    # See module docstring: CSF scrambles coordinates past ~715.8M points.
+    # Stride-subsample for classification only; acquisition order sweeps the
+    # site, so a stride is spatially even. The FULL cloud is normalised below.
+    n = len(points)
+    if n > a.csf_max_points:
+        step = int(np.ceil(n / a.csf_max_points))
+        sub_idx = np.arange(0, n, step, dtype=np.int64)
+        csf_points = np.ascontiguousarray(points[sub_idx])
+        print(f"Cloud exceeds CSF ceiling ({n:,} > {a.csf_max_points:,}): "
+              f"classifying ground on a 1-in-{step} stride subset "
+              f"({len(sub_idx):,} points). Full cloud is preserved in the output.")
+    else:
+        sub_idx    = None
+        csf_points = points
+    n_classified = len(csf_points)
+
     # ── GROUND FILTERING WITH CSF ──────────────────────────────
     print("Running CSF ground filter...")
     csf_filter = CSF.CSF()
@@ -141,31 +181,48 @@ def main():
     csf_filter.params.iterations       = a.iterations
     csf_filter.params.class_threshold  = a.threshold
 
-    csf_filter.setPointCloud(points)
+    csf_filter.setPointCloud(csf_points)
 
     ground_indices     = CSF.VecInt()
     non_ground_indices = CSF.VecInt()
     csf_filter.do_filtering(ground_indices, non_ground_indices)
 
-    ground_indices     = np.array(list(ground_indices))
-    non_ground_indices = np.array(list(non_ground_indices))
+    # np.fromiter avoids materialising a giant Python list (the old
+    # np.array(list(...)) costs ~28 bytes/int and minutes on 1e8 indices).
+    n_veg          = len(non_ground_indices)
+    ground_indices = np.fromiter(ground_indices, dtype=np.int64,
+                                 count=len(ground_indices))
 
     if ground_indices.size == 0:
         sys.exit("ERROR: CSF classified zero ground points. Adjust "
                  "--cloth-res / --threshold / --rigidness for this terrain.")
 
+    # Map subset-relative indices back to the full cloud.
+    if sub_idx is not None:
+        ground_indices = sub_idx[ground_indices]
+        del csf_points, sub_idx   # free the subset copy (~10 GB on 1e9 clouds)
+
     print(f"Ground points:     {len(ground_indices):,}")
-    print(f"Vegetation points: {len(non_ground_indices):,}")
+    print(f"Vegetation points: {n_veg:,}"
+          + (" (of CSF subset)" if n > a.csf_max_points else ""))
     print(f"Ground percentage: "
-          f"{len(ground_indices) / len(points) * 100:.1f}%")
+          f"{len(ground_indices) / n_classified * 100:.1f}% of classified points")
 
     # ── HEIGHT NORMALISATION ───────────────────────────────────
     print("Normalising height...")
     ground_points = points[ground_indices]   # shape (N, 3) — absolute XYZ
 
+    # Chunked query bounds transient memory (a single 1e9-point query would
+    # allocate ~18 GB of distance+index scratch); workers=-1 uses every vCPU.
     ground_tree  = cKDTree(ground_points[:, :2])
-    _, idx       = ground_tree.query(points[:, :2], k=1)
-    normalised_z = points[:, 2] - ground_points[idx, 2]
+    normalised_z = np.empty(n, dtype=np.float64)
+    Q = 50_000_000
+    for s in range(0, n, Q):
+        e = min(s + Q, n)
+        _, idx = ground_tree.query(points[s:e, :2], k=1, workers=-1)
+        normalised_z[s:e] = points[s:e, 2] - ground_points[idx, 2]
+        if n > Q:
+            print(f"  ...normalised {e:,} / {n:,} points", flush=True)
 
     # ── QUALITY CHECK ──────────────────────────────────────────
     ground_z_after = normalised_z[ground_indices]
@@ -244,26 +301,19 @@ def main():
     x_min = ground_points[:, 0].min()
     y_min = ground_points[:, 1].min()
 
-    col     = ((ground_points[:, 0] - x_min) / a.grid).astype(int)
-    row     = ((ground_points[:, 1] - y_min) / a.grid).astype(int)
+    col     = ((ground_points[:, 0] - x_min) / a.grid).astype(np.int64)
+    row     = ((ground_points[:, 1] - y_min) / a.grid).astype(np.int64)
     cell_id = row * (col.max() + 1) + col
 
-    grid = {}
-    for i, cid in enumerate(cell_id):
-        if cid not in grid:
-            grid[cid] = []
-        grid[cid].append(ground_points[i])
-
-    grid_points = []
-    for pts_in_cell in grid.values():
-        cell_arr = np.array(pts_in_cell)
-        grid_points.append([
-            float(np.median(cell_arr[:, 0])),
-            float(np.median(cell_arr[:, 1])),
-            float(np.median(cell_arr[:, 2])),
-        ])
-
-    grid_points = np.array(grid_points)
+    # Vectorised median-per-cell (the previous per-point Python loop ran for
+    # hours once ground points reached 1e8). sort=False keeps first-seen cell
+    # order, matching the old dict-insertion output ordering.
+    df = pd.DataFrame({'cid': cell_id,
+                       'x': ground_points[:, 0],
+                       'y': ground_points[:, 1],
+                       'z': ground_points[:, 2]})
+    grid_points = (df.groupby('cid', sort=False)[['x', 'y', 'z']]
+                     .median().to_numpy())
 
     np.savetxt(
         ground_csv_path,

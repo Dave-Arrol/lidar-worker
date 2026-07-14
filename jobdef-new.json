@@ -1,0 +1,9 @@
+{
+    "platformCapabilities":  null,
+    "timeout":  {
+                    "attemptDurationSeconds":  43200
+                },
+    "jobDefinitionName":  null,
+    "type":  null,
+    "containerProperties":  null
+}

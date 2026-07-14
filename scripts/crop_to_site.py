@@ -30,7 +30,6 @@ numpy. No pyproj needed; this is pure coordinate-space.
 
 import argparse
 import json
-import shutil
 import sys
 from collections import deque
 
@@ -45,15 +44,20 @@ def log(msg):
 
 
 def pass1_histogram(path, bin_m):
-    """Stream the file, build a sparse 2D density histogram keyed (ix, iy)."""
+    """Stream the file, build a sparse 2D density histogram keyed (ix, iy).
+    Also returns the TRUE point-derived bbox (headers can lie)."""
     counts = {}
     total = 0
+    xmin = ymin = float("inf")
+    xmax = ymax = float("-inf")
     with laspy.open(path) as f:
         n = f.header.point_count
         log(f"pass 1: {n:,} points, {bin_m} m bins")
         for chunk in f.chunk_iterator(CHUNK):
             x = np.asarray(chunk.x)
             y = np.asarray(chunk.y)
+            xmin = min(xmin, float(x.min())); xmax = max(xmax, float(x.max()))
+            ymin = min(ymin, float(y.min())); ymax = max(ymax, float(y.max()))
             ix = np.floor(x / bin_m).astype(np.int64)
             iy = np.floor(y / bin_m).astype(np.int64)
             # pack pair into one int64 key for fast unique-count
@@ -64,7 +68,7 @@ def pass1_histogram(path, bin_m):
             total += len(x)
             if total % 100_000_000 < CHUNK:
                 log(f"  ...pass 1 read {total:,} / {n:,}")
-    return counts
+    return counts, (xmin, xmax, ymin, ymax)
 
 
 def unpack(key):
@@ -156,20 +160,29 @@ def main():
                          "cropping entirely and just copy (default 5 km)")
     args = ap.parse_args()
 
-    # Fast path: header bbox already sane -> nothing to do.
+    # v2: NEVER trust the header — DJI merges can write a sane-looking header over
+    # points that span hundreds of km. Always stream pass 1 and decide from the
+    # actual point distribution. (Header is read for reporting/mismatch detection only.)
     with laspy.open(args.input) as f:
         hx = f.header.maxs[0] - f.header.mins[0]
         hy = f.header.maxs[1] - f.header.mins[1]
         n = f.header.point_count
-    log(f"header bbox extent: {hx:,.0f} m x {hy:,.0f} m ({n:,} points)")
-    if hx <= args.sane_extent and hy <= args.sane_extent:
-        log("extent already sane — copying through, no crop needed")
-        shutil.copyfile(args.input, args.output)
-        print(json.dumps({"cropped": False, "kept": n, "total": n}))
-        return 0
+    log(f"header CLAIMS extent: {hx:,.0f} m x {hy:,.0f} m ({n:,} points)")
 
     min_pts_per_cell = max(1, int(args.min_density * args.bin * args.bin))
-    counts = pass1_histogram(args.input, args.bin)
+    counts, true_bbox = pass1_histogram(args.input, args.bin)
+    tx = true_bbox[1] - true_bbox[0]
+    ty = true_bbox[3] - true_bbox[2]
+    log(f"actual point extent:  {tx:,.0f} m x {ty:,.0f} m "
+        f"X[{true_bbox[0]:,.0f}, {true_bbox[1]:,.0f}] Y[{true_bbox[2]:,.0f}, {true_bbox[3]:,.0f}]")
+    if tx > 2 * max(hx, 1) or ty > 2 * max(hy, 1):
+        log("WARNING: header bbox is LYING — actual points span far beyond the declared "
+            "extent. Do not trust this file's header anywhere else in the pipeline.")
+
+    if tx <= args.sane_extent and ty <= args.sane_extent:
+        log("actual extent already sane — passing through, no crop needed")
+        print(json.dumps({"cropped": False, "kept": n, "total": n}))
+        return 0
     clusters = find_dominant_cluster(counts, args.bin, min_pts_per_cell)
     if not clusters:
         log("ERROR: no dense cluster found — cloud may be empty or degenerate")

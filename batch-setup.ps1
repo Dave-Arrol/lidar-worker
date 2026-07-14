@@ -123,7 +123,7 @@ $jobDefJson = @"
     "fargatePlatformConfiguration": { "platformVersion": "LATEST" }
   },
   "retryStrategy": { "attempts": 1 },
-  "timeout": { "attemptDurationSeconds": 7200 }
+  "timeout": { "attemptDurationSeconds": 43200 } 
 }
 "@
 $jdFile = Join-Path $env:TEMP 'arrol-jobdef.json'

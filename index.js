@@ -504,6 +504,26 @@ async function ingestTreeVolumes(geojsonPath, estateId, cloudJobId) {
 async function runAnalyses(cloudJobId, ids) {
   const { data: job } = await supabase.from('lidar_jobs').select('raw_path,site_id,copc_path,storage').eq('id', cloudJobId).single()
   if (!job) throw new Error('cloud job not found: ' + cloudJobId)
+
+  // Orphan sweep: fail any leftover non-terminal rows for this cloud from a
+  // previous run that was hard-killed (Batch timeout, OOM, spot reclaim) and so
+  // never wrote its own failure. Live runs are protected by the heartbeat below:
+  // their rows are never more than ~60s stale, so the 5-minute cutoff can only
+  // match the dead. This makes the worker self-cleaning - no cron needed.
+  try {
+    const staleBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString()
+    const { data: swept } = await supabase.from('lidar_analyses')
+      .update({
+        status: 'failed',
+        error: 'orphaned: a previous run terminated without reporting (timeout/OOM/kill); swept at next job start',
+        completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      })
+      .eq('cloud_job_id', cloudJobId)
+      .in('status', ['queued', 'processing'])
+      .lt('updated_at', staleBefore)
+      .select('id')
+    if (swept && swept.length) console.log(`[analyse] swept ${swept.length} orphaned analysis row(s) from a previous run`)
+  } catch (e) { console.error('orphan sweep failed (non-fatal):', errMsg(e).slice(0, 200)) }
   const chain = resolveChain(ids)
 
   // ONE shared workspace: every stage reads/writes named artifacts here, so a stage
@@ -523,6 +543,22 @@ async function runAnalyses(cloudJobId, ids) {
     }).select('id').single()
     planIds.push(row.id)
   }
+
+  // Heartbeat: touch updated_at on every non-terminal row of THIS plan every 60s
+  // for the whole life of the job (download, crop, and each stage). A hard kill
+  // stops the heartbeat, so 'processing/queued with updated_at older than ~5 min'
+  // becomes a reliable orphan signature - which the sweep above and the portal
+  // can both act on. Terminal rows are excluded so ready/failed timestamps stay
+  // meaningful. unref() keeps the interval from holding a run-once task open.
+  const heartbeat = setInterval(() => {
+    supabase.from('lidar_analyses')
+      .update({ updated_at: new Date().toISOString() })
+      .in('id', planIds)
+      .in('status', ['queued', 'processing'])
+      .then(({ error }) => { if (error) console.error('heartbeat write failed:', error.message) })
+  }, 60_000)
+  heartbeat.unref()
+  try {
 
   // Materialise the cloud into the workspace.
   if (isS3) {
@@ -569,7 +605,8 @@ async function runAnalyses(cloudJobId, ids) {
                   'cloud to a projected CRS before upload.'
       for (const id of planIds) {
         await supabase.from('lidar_analyses').update({
-          status: 'failed', error: msg, updated_at: new Date().toISOString(),
+          status: 'failed', error: msg,
+          completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
         }).eq('id', id)
       }
       throw new Error(msg)
@@ -616,7 +653,8 @@ async function runAnalyses(cloudJobId, ids) {
                 'bbox beyond recovery) - inspect the source LAZ. ' + errMsg(e).slice(0, 300)
     for (const id of planIds) {
       await supabase.from('lidar_analyses').update({
-        status: 'failed', error: msg, updated_at: new Date().toISOString(),
+        status: 'failed', error: msg,
+        completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       }).eq('id', id)
     }
     throw new Error(msg)
@@ -648,9 +686,10 @@ async function runAnalyses(cloudJobId, ids) {
   for (let i = 0; i < chain.length; i++) {
     const a = chain[i]
     const analysisId = planIds[i]
-    // updated_at marks the processing-start time (used for the live elapsed timer).
+    // started_at anchors the elapsed timer (updated_at is now a heartbeat and
+    // moves every 60s - the portal timer should read started_at, not updated_at).
     await supabase.from('lidar_analyses').update({
-      status: 'processing', updated_at: new Date().toISOString(),
+      status: 'processing', started_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     }).eq('id', analysisId)
 
     try {
@@ -682,12 +721,14 @@ async function runAnalyses(cloudJobId, ids) {
         else if (out.role === 'table')  produced.push(await handleTable(fpath, out, analysisId))
       }
       await supabase.from('lidar_analyses').update({
-        status: 'ready', summary, outputs: produced, updated_at: new Date().toISOString(),
+        status: 'ready', summary, outputs: produced,
+        completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       }).eq('id', analysisId)
       console.log('analysis ready', a.id, analysisId)
     } catch (e) {
       await supabase.from('lidar_analyses').update({
-        status: 'failed', error: errMsg(e).slice(0, 500), updated_at: new Date().toISOString(),
+        status: 'failed', error: errMsg(e).slice(0, 500),
+        completed_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       }).eq('id', analysisId)
       throw e
     }
@@ -698,6 +739,11 @@ async function runAnalyses(cloudJobId, ids) {
     catch (e) { console.error('tag_analysis_geometry failed (non-fatal):', errMsg(e).slice(0, 300)) }
   }
   await fsp.rm(work, { recursive: true, force: true })
+  } finally {
+    // Stop the heartbeat on every exit path (success, guard failure, stage
+    // throw) so a run-once task can exit and the server mode never leaks timers.
+    clearInterval(heartbeat)
+  }
 }
 
 // Default entry: run as the long-lived HTTP server (the legacy always-on service).
