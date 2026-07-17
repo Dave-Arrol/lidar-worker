@@ -65,6 +65,23 @@ _E = 0.0360541
 _K = 0.315049301
 _C = 0.138763302
 _D = 0.118288
+
+# Phase 3 DBH-quality filters (from the improved lidar model).
+SLENDERNESS_THRESHOLD = 60.0   # h*100/dbh below this = geometrically implausible
+                               # circle-fit (branch contamination inflating radius).
+MIN_MERCH_DBH_CM      = 7.0    # stems below this are sub-merchantable (7 cm top).
+
+# FC abbreviated-tariff Table A8 (Matthews & Mackie 2006): per-sample-tree
+# tariff estimated DIRECTLY from height + DBH, T = A1 + A2*h + A3*dbh. Computed
+# in parallel with the worker's profile/form-factor-derived tariff so both
+# stand estimates are reported side by side.
+TARIFF_A8_A1 =  8.292030
+TARIFF_A8_A2 =  1.771173
+TARIFF_A8_A3 = -0.416509
+
+
+def sample_tree_tariff_a8(dbh_cm: float, height_m: float) -> float:
+    return TARIFF_A8_A1 + TARIFF_A8_A2 * height_m + TARIFF_A8_A3 * dbh_cm
 MERCH_TOP_DIAM_M = 0.07            # 7 cm top — merchantability limit
 BUTT_SWELL = 1.12                  # ground-section diameter vs lowest slice
 FALLBACK_FORM_FACTOR = 0.42        # conifer-typical; only for DBH-no-profile trees
@@ -465,6 +482,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sample_t_by_tid: Dict[int, float] = {}  # tree_id -> its own tariff (for per-compartment refit)
     sample_kind: Dict[int, str] = {}        # tree_id -> "profile" | "form_factor"
     sample_vol: Dict[int, float] = {}
+    sample_tariffs_a8: List[float] = []     # Table A8 tariff for the same sample trees
     for tid, d in dbh.items():
         dbh_cm = d.get("dbh_cm")
         if not dbh_cm or dbh_cm <= 0:
@@ -474,6 +492,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             continue
         conf = d.get("confidence")
         if conf is not None and conf < args.min_confidence:
+            continue
+        # Geometric plausibility: a circle-fit DBH implausibly large for the tree's
+        # height (low slenderness) is branch-contaminated - not a valid sample tree.
+        h_s = d.get("height_m")
+        if h_s and h_s > 0 and (h_s * 100.0 / dbh_cm) < SLENDERNESS_THRESHOLD:
             continue
 
         ba = basal_area_m2(dbh_cm)
@@ -496,6 +519,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sample_t_by_tid[tid] = t
                 sample_kind[tid] = kind
                 sample_vol[tid] = vol
+                # Table A8 tariff for the identical sample tree (needs height).
+                h_a8 = d.get("height_m")
+                if h_a8 and h_a8 > 0:
+                    t_a8 = sample_tree_tariff_a8(dbh_cm, h_a8)
+                    if t_a8 > 0:
+                        sample_tariffs_a8.append(t_a8)
 
     if not sample_tariffs:
         raise SystemExit("tariff.py: no volume sample trees "
@@ -505,6 +534,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stand_tariff, dropped = _robust_mean_tariff(sample_tariffs, args.no_reject, args.outlier_sd)
     if dropped:
         warnings.append(f"{dropped} sample tree(s) rejected as tariff outliers.")
+
+    # Karen's FC Table A8 stand tariff (parallel estimate; stand-level only for now -
+    # the per-compartment refit stays on the worker method as requested).
+    if sample_tariffs_a8:
+        stand_tariff_a8, _dropped_a8 = _robust_mean_tariff(
+            sample_tariffs_a8, args.no_reject, args.outlier_sd)
+    else:
+        stand_tariff_a8 = None
 
     n_profile = sum(1 for k in sample_kind.values() if k == "profile")
     n_ff = sum(1 for k in sample_kind.values() if k == "form_factor")
@@ -544,7 +581,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rows: List[Dict[str, Any]] = []
     comp_agg: Dict[Any, Dict[str, Any]] = {}
     total_vol = 0.0
+    primary_vol = 0.0       # circle_fit_filtered stems only (high-confidence)
+    augmented_vol = 0.0     # circle_fit_filtered + hd_model (all usable)
+    total_vol_a8 = 0.0      # Table A8 method (stand-level tariff, Karen)
+    primary_vol_a8 = 0.0
+    augmented_vol_a8 = 0.0
     n_measured = n_imputed = n_no_metrics = 0
+    n_slenderness_flagged = 0
+    n_below_min_dbh = 0
+    tier_counts: Dict[str, int] = {}
     measured_dbhs: List[float] = []
     heights: List[float] = []
 
@@ -555,25 +600,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             heights.append(h)
 
         d = dbh.get(tid, {})
-        dbh_cm = d.get("dbh_cm")
-        if dbh_cm and dbh_cm > 0:
-            dbh_source = "measured"
-            n_measured += 1
-            measured_dbhs.append(dbh_cm)
+        measured_dbh = d.get("dbh_cm")
+        status = (d.get("status") or "").strip()
+        slender = (h * 100.0 / measured_dbh) if (measured_dbh and measured_dbh > 0 and h and h > 0) else None
+        flagged = slender is not None and slender < SLENDERNESS_THRESHOLD
+
+        # DBH source + quality tier. The slenderness downgrade is the key fix: a
+        # branch-contaminated circle-fit is replaced by the H-D imputation rather
+        # than trusted. dbh_source stays measured/imputed/stand_mean for backward
+        # compatibility; dbh_tier carries the finer quality taxonomy.
+        if measured_dbh and measured_dbh > 0:
+            if flagged and h and h > 0:
+                dbh_cm = _predict_dbh(model, h)
+                dbh_source = "imputed"; dbh_tier = "hd_model"
+                n_imputed += 1; n_slenderness_flagged += 1
+            elif flagged:
+                dbh_cm = measured_dbh
+                dbh_source = "measured"; dbh_tier = "circle_fit_flagged"
+                n_measured += 1; measured_dbhs.append(dbh_cm); n_slenderness_flagged += 1
+            elif status == "dbh_unsupported":
+                dbh_cm = measured_dbh
+                dbh_source = "measured"; dbh_tier = "circle_fit_weak"
+                n_measured += 1; measured_dbhs.append(dbh_cm)
+            else:
+                dbh_cm = measured_dbh
+                dbh_source = "measured"; dbh_tier = "circle_fit_filtered"
+                n_measured += 1; measured_dbhs.append(dbh_cm)
         elif h and h > 0:
             dbh_cm = _predict_dbh(model, h)
-            dbh_source = "imputed"
+            dbh_source = "imputed"; dbh_tier = "hd_model"
             n_imputed += 1
         else:
             dbh_cm = model.get("mean_dbh")
-            dbh_source = "stand_mean"
+            dbh_source = "stand_mean"; dbh_tier = "stand_mean"
             n_no_metrics += 1
+        tier_counts[dbh_tier] = tier_counts.get(dbh_tier, 0) + 1
 
         cid = tree_comp.get(tid)
         applied_tariff = comp_tariff.get(cid, stand_tariff)
         ba = basal_area_m2(dbh_cm) if dbh_cm and dbh_cm > 0 else 0.0
         vol = max(0.0, volume_from_tariff(applied_tariff, ba))
+        # Table A8 volume: STAND-level A8 tariff applied to every tree (no per-compartment
+        # refit for A8 at the moment - the compartment trigger stays on the worker method).
+        vol_a8 = (max(0.0, volume_from_tariff(stand_tariff_a8, ba))
+                  if stand_tariff_a8 and stand_tariff_a8 > 0 else 0.0)
+        # Sub-merchantable floor: stems below the 7 cm-top threshold carry no merch volume.
+        if dbh_cm and 0 < dbh_cm < MIN_MERCH_DBH_CM:
+            vol = 0.0
+            vol_a8 = 0.0
+            n_below_min_dbh += 1
         total_vol += vol
+        total_vol_a8 += vol_a8
+        if dbh_tier == "circle_fit_filtered":
+            primary_vol += vol
+            primary_vol_a8 += vol_a8
+        if dbh_tier in ("circle_fit_filtered", "hd_model"):
+            augmented_vol += vol
+            augmented_vol_a8 += vol_a8
 
         if cid is not None:
             ca = comp_agg.setdefault(cid, {"n": 0, "vol": 0.0, "dbhs": [], "heights": []})
@@ -591,12 +674,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "height_m": round(h, 2) if h else "",
             "dbh_cm": round(dbh_cm, 1) if dbh_cm else "",
             "dbh_source": dbh_source,
+            "dbh_tier": dbh_tier,
             "basal_area_m2": round(ba, 5),
             "compartment_id": cid if cid is not None else "",
             "tariff_applied": round(applied_tariff, 2),
             "is_sample_tree": tid in sample_kind,
             "sample_volume_m3": round(sample_vol[tid], 4) if tid in sample_vol else "",
             "merch_volume_m3": round(vol, 4),
+            "merch_volume_a8_m3": round(vol_a8, 4),
         })
 
     if n_no_metrics:
@@ -609,8 +694,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   "medium" if len(sample_tariffs) >= 4 else "low")
 
     # ---- write per-tree CSV (table role) ----
-    csv_fields = ["tree_id", "x", "y", "height_m", "dbh_cm", "dbh_source", "basal_area_m2",
-                  "compartment_id", "tariff_applied", "is_sample_tree", "sample_volume_m3", "merch_volume_m3"]
+    csv_fields = ["tree_id", "x", "y", "height_m", "dbh_cm", "dbh_source", "dbh_tier", "basal_area_m2",
+                  "compartment_id", "tariff_applied", "is_sample_tree", "sample_volume_m3",
+                  "merch_volume_m3", "merch_volume_a8_m3"]
     with open(args.out_csv, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=csv_fields)
         w.writeheader()
@@ -668,11 +754,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "dbh_measured": n_measured,
         "dbh_imputed": n_imputed,
         "dbh_from_stand_mean": n_no_metrics,
+        # DBH quality tiering (Phase 3, from the improved lidar model)
+        "dbh_tiers": tier_counts,
+        "n_slenderness_flagged": n_slenderness_flagged,
+        "n_below_min_dbh": n_below_min_dbh,
+        "min_merch_dbh_cm": MIN_MERCH_DBH_CM,
         "mean_dbh_cm": round(statistics.fmean(measured_dbhs), 1) if measured_dbhs else None,
         "mean_height_m": round(statistics.fmean(heights), 1) if heights else None,
         "tariff_min": round(min(sample_tariffs), 1),
         "tariff_max": round(max(sample_tariffs), 1),
         "total_merch_volume_m3": round(total_vol, 2),
+        # Primary = high-confidence circle-fit stems only; Augmented = + H-D imputed.
+        # The gap between them is an honest confidence band on the standing volume.
+        "primary_volume_m3": round(primary_vol, 2),
+        "augmented_volume_m3": round(augmented_vol, 2),
+        # Table A8 (Karen) parallel estimate, stand-level.
+        "stand_tariff_a8": round(stand_tariff_a8, 2) if stand_tariff_a8 else None,
+        "stand_tariff_a8_rounded": int(round(stand_tariff_a8)) if stand_tariff_a8 else None,
+        "total_merch_volume_a8_m3": round(total_vol_a8, 2),
+        "primary_volume_a8_m3": round(primary_vol_a8, 2),
+        "augmented_volume_a8_m3": round(augmented_vol_a8, 2),
+        # Both estimates side by side for the site page to render.
+        "tariff_methods": [
+            {"key": "profile", "label": "Profile / form-factor (worker)",
+             "stand_tariff": round(stand_tariff, 2),
+             "stand_tariff_rounded": int(round(stand_tariff)),
+             "total_merch_volume_m3": round(total_vol, 2),
+             "primary_volume_m3": round(primary_vol, 2),
+             "augmented_volume_m3": round(augmented_vol, 2)},
+            {"key": "table_a8", "label": "FC Table A8 (height + DBH)",
+             "stand_tariff": round(stand_tariff_a8, 2) if stand_tariff_a8 else None,
+             "stand_tariff_rounded": int(round(stand_tariff_a8)) if stand_tariff_a8 else None,
+             "total_merch_volume_m3": round(total_vol_a8, 2),
+             "primary_volume_m3": round(primary_vol_a8, 2),
+             "augmented_volume_m3": round(augmented_vol_a8, 2)},
+        ],
         "mean_volume_per_tree_m3": round(total_vol / n_total, 4) if n_total else None,
         "dbh_height_r2": round(model["r2"], 3) if model.get("r2") is not None else None,
         "compartments_summarised": len(comp_rows),
@@ -707,9 +823,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "properties": {
                         "tree_id": r["tree_id"],
                         "merch_volume_m3": r["merch_volume_m3"],
+                        "merch_volume_a8_m3": r["merch_volume_a8_m3"],
                         "dbh_cm": r["dbh_cm"],
                         "height_m": r["height_m"],
                         "dbh_source": r["dbh_source"],
+                        "dbh_tier": r.get("dbh_tier"),
                         "compartment_id": cid if cid is not None else "",
                         "is_sample_tree": r["is_sample_tree"],
                     },
@@ -717,9 +835,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(args.out_geojson, "w", encoding="utf-8") as fh:
             json.dump({"type": "FeatureCollection", "features": feats}, fh)
 
+    _a8t = summary['stand_tariff_a8_rounded']
     print(f"tariff.py: stand tariff {summary['stand_tariff_rounded']} "
-          f"({summary['stand_tariff']}), {n_total} trees, "
-          f"{summary['total_merch_volume_m3']} m3 merch; "
+          f"({summary['stand_tariff']}) worker / {_a8t} table-A8, {n_total} trees, "
+          f"{summary['total_merch_volume_m3']} m3 worker / "
+          f"{summary['total_merch_volume_a8_m3']} m3 A8 merch; "
           f"{len(sample_tariffs)} sample trees ({n_profile} profile / {n_ff} form-factor).")
     for wmsg in warnings:
         print(f"  ! {wmsg}")

@@ -52,6 +52,7 @@ Outputs:
 
 import argparse
 import csv
+import json
 import colorsys
 from pathlib import Path
 import memlog
@@ -67,6 +68,7 @@ from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from skimage.segmentation import watershed
 from sklearn.decomposition import PCA
+from rasterio.warp import transform as warp_transform
 
 import os
 import sys
@@ -89,6 +91,9 @@ _ap.add_argument('--out-candidates',   required=True, help='Output stem-candidat
 _ap.add_argument('--out-treetops-las', required=True, help='Output tree-top pole LAS.')
 _ap.add_argument('--out-treetops-csv', required=True, help='Output tree-tops CSV.')
 _ap.add_argument('--out-summary-csv',  required=True, help='Output per-tree segment summary CSV.')
+_ap.add_argument('--crs',                default='EPSG:27700', help='CRS of input X/Y for GeoJSON reprojection.')
+_ap.add_argument('--out-summary',        default=None, help='Output detection-summary JSON (optional).')
+_ap.add_argument('--out-quality-geojson', default=None, help='Output per-tree stem-quality GeoJSON in EPSG:4326 (optional).')
 _args = _ap.parse_args()
 
 INPUT_FILE          = Path(_args.input)
@@ -97,16 +102,19 @@ TREETOPS_FILE       = Path(_args.out_treetops_las)
 TREETOPS_CSV        = Path(_args.out_treetops_csv)
 PLOT_OUTPUT         = OUTPUT_FILE.with_name(OUTPUT_FILE.stem + '_topview.png')
 SEGMENT_SUMMARY_CSV = Path(_args.out_summary_csv)
+OUTPUT_CRS          = _args.crs
+SUMMARY_JSON        = Path(_args.out_summary) if _args.out_summary else None
+QUALITY_GEOJSON     = Path(_args.out_quality_geojson) if _args.out_quality_geojson else None
 
 # ── SETTINGS ──────────────────────────────────────────────
 
 # CHM + treetop detection
 STEM_MIN_H      = 0.5
-STEM_MAX_H      = 4.0
+STEM_MAX_H      = 5.0
 CHM_RESOLUTION  = 0.3
-TREE_TOP_RADIUS = 0.8
-NMS_DISTANCE    = 0.8
-HMIN            = 12.0
+TREE_TOP_RADIUS = 0.3
+NMS_DISTANCE    = 0.3
+HMIN            = 10.0
 MIN_POINTS      = 20
 
 # ── Large-cloud tiling ────────────────────────────────────
@@ -122,33 +130,34 @@ TILE_TARGET_PTS = int(os.environ.get('SEG_TILE_TARGET_POINTS', '12000000'))
 # Provisional stem seed
 # Used to drive the radial filter. Not merely diagnostic — see module docstring.
 TRUNK_SLICE_Z_MIN = 0.5
-TRUNK_SLICE_Z_MAX = 4.0
+TRUNK_SLICE_Z_MAX = 5.0
 TRUNK_SLICE_STEP  = 0.2
 DBH_MIN_POINTS    = 10
-DBH_MAX_RADIUS    = 0.6
-DBH_MIN_RADIUS    = 0.03
+DBH_MAX_RADIUS    = 0.4
+DBH_MIN_RADIUS    = 0.035
 TRUNK_MIN_SLICES  = 3
 
 # Density filter
 DENSITY_RADIUS         = 0.12
 DENSITY_MIN_NEIGHBOURS = 3
 
-# Radial consistency filter
-# Retains points within [seed_r * R_MIN_MULT, seed_r * R_MAX_MULT] of the
-# provisional seed centre. R_MIN_MULT=0.01 is effectively zero (nothing is
-# filtered inward). The meaningful constraint is the upper bound: R_MAX_MULT=1.40
-# retains points up to 40% beyond the provisional radius.
-#
-# Empirical basis for R_MAX_MULT=1.40: not yet validated against ground truth.
-# Revisit once dbh_extraction_v2.py results are available. If DBH estimates
-# are systematically low, consider increasing this value or disabling the filter.
-#
-# Applied only when the provisional seed is reliable (seed_status == 'seed_ok').
-# If a tree's seed is unreliable, its points are passed through unfiltered.
+# Radial consistency filter - treetop-centred hard-radius scheme.
+# Points further than RADIAL_HARD_RADIUS (m) from the tree's treetop centre
+# (falling back to the provisional seed centre when no treetop is available)
+# are dropped. This replaces the earlier seed-multiple [R_MIN_MULT, R_MAX_MULT]
+# band. RADIAL_MIN_POINTS_KEEP still guards against total collapse of a tree.
 APPLY_RADIAL_FILTER    = True
-RADIAL_R_MIN_MULT      = 0.01
-RADIAL_R_MAX_MULT      = 1.40
+RADIAL_HARD_RADIUS     = 0.9
 RADIAL_MIN_POINTS_KEEP = 10   # safeguard: skip filter if fewer points would remain
+
+# Per-point verticality filter (H2-2026 model improvement).
+# Each stem point is scored by how linear/vertical its local k-NN neighbourhood
+# is via PCA ((l1 - l2)/l1); points below VERT_MIN_SCORE are dropped before DBH
+# extraction, and the score is carried into the candidate LAS as `stem_score`.
+# Toggle off with SEG_VERTICALITY=0 to A/B against pre-verticality behaviour.
+APPLY_VERTICALITY_FILTER = os.environ.get('SEG_VERTICALITY', '1') != '0'
+VERT_MIN_SCORE           = 0.40
+K_VERT                   = 20
 
 # Segment scoring / QC
 PCA_MIN_POINTS         = 30
@@ -492,28 +501,7 @@ def score_all_segments(stem_x, stem_y, stem_z, tree_ids, valid_trees):
 # RADIAL CONSISTENCY FILTER
 # ═══════════════════════════════════════════════════════════
 
-def apply_radial_filter(stem_x, stem_y, tree_ids, valid_trees, score_lookup):
-    """
-    For each accepted tree with a reliable provisional seed, remove points
-    outside [seed_r * R_MIN_MULT, seed_r * R_MAX_MULT] of the seed centre.
-
-    This filter is load-bearing: it modifies the point cloud passed to
-    dbh_extraction_v2.py. Per-tree statistics (n_before, n_removed,
-    retention_fraction) are returned for inclusion in the segment summary CSV
-    so that compounded filtering effects can be audited downstream.
-
-    Trees with seed_status != 'seed_ok' are passed through unmodified.
-    The RADIAL_MIN_POINTS_KEEP safeguard prevents total collapse of a tree
-    if the provisional seed is geometrically misleading, but does NOT protect
-    against systematic one-sided clipping of a leaning stem. If DBH estimates
-    from dbh_extraction_v2.py are consistently low, audit per-tree retention
-    fractions in the segment summary CSV and consider increasing R_MAX_MULT or
-    disabling this filter.
-
-    Returns:
-      - filtered tree_ids array (zeros where points were removed)
-      - radial_stats: dict[tree_id -> {n_before, n_removed, retention_fraction}]
-    """
+def apply_radial_filter(stem_x, stem_y, tree_ids, valid_trees, score_lookup, tree_top_lookup):
     filtered_ids = tree_ids.copy()
     radial_stats = {}
 
@@ -530,22 +518,16 @@ def apply_radial_filter(stem_x, stem_y, tree_ids, valid_trees, score_lookup):
             }
             continue
 
-        seed = score_lookup.get(tree_id, {})
+        tt = tree_top_lookup.get(tree_id, {})
+        cx = tt.get('tree_top_x', np.nan)
+        cy = tt.get('tree_top_y', np.nan)
 
-        # Only filter trees with a reliable seed
-        if seed.get('seed_status') != 'seed_ok':
-            radial_stats[tree_id] = {
-                'radial_n_before': n_before,
-                'radial_n_removed': 0,
-                'radial_retention_frac': 1.0
-            }
-            continue
+        if np.isnan(cx) or np.isnan(cy):
+            seed = score_lookup.get(tree_id, {})
+            cx = seed.get('seed_cx', np.nan)
+            cy = seed.get('seed_cy', np.nan)
 
-        seed_cx = seed['seed_cx']
-        seed_cy = seed['seed_cy']
-        seed_r  = seed['seed_r_m']
-
-        if np.isnan(seed_cx) or np.isnan(seed_cy) or np.isnan(seed_r) or seed_r <= 0:
+        if np.isnan(cx) or np.isnan(cy):
             radial_stats[tree_id] = {
                 'radial_n_before': n_before,
                 'radial_n_removed': 0,
@@ -554,27 +536,64 @@ def apply_radial_filter(stem_x, stem_y, tree_ids, valid_trees, score_lookup):
             continue
 
         idx  = np.where(mask)[0]
-        dist = np.sqrt((stem_x[idx] - seed_cx)**2 + (stem_y[idx] - seed_cy)**2)
-        keep = (dist >= seed_r * RADIAL_R_MIN_MULT) & (dist <= seed_r * RADIAL_R_MAX_MULT)
+        dist = np.sqrt((stem_x[idx] - cx)**2 + (stem_y[idx] - cy)**2)
+        keep = dist <= RADIAL_HARD_RADIUS
 
-        n_kept = int(keep.sum())
+        n_kept    = int(keep.sum())
         n_removed = n_before - n_kept
 
         if n_kept >= RADIAL_MIN_POINTS_KEEP:
             filtered_ids[idx[~keep]] = 0
         else:
-            # Seed is likely misleading — pass through unmodified
             n_removed = 0
 
         radial_stats[tree_id] = {
-            'radial_n_before':        n_before,
-            'radial_n_removed':       n_removed,
-            'radial_retention_frac':  round((n_before - n_removed) / n_before, 4)
+            'radial_n_before':       n_before,
+            'radial_n_removed':      n_removed,
+            'radial_retention_frac': round((n_before - n_removed) / n_before, 4)
         }
 
     total_removed = sum(s['radial_n_removed'] for s in radial_stats.values())
     print(f"  Radial filter removed {total_removed:,} points across {len(valid_trees)} trees")
     return filtered_ids, radial_stats
+
+
+# ===========================================================
+# PER-POINT VERTICALITY SCORING
+# ===========================================================
+
+def compute_point_verticality(stem_x, stem_y, stem_z, tree_ids, k=20):
+    n = len(stem_x)
+    stem_scores = np.zeros(n, dtype=np.float32)
+
+    unique_ids = np.unique(tree_ids)
+    unique_ids = unique_ids[unique_ids > 0]
+
+    for tid in unique_ids:
+        mask = tree_ids == tid
+        idx  = np.where(mask)[0]
+        pts  = np.stack([stem_x[idx], stem_y[idx], stem_z[idx]], axis=1)
+
+        if len(pts) < k + 1:
+            stem_scores[idx] = 0.5
+            continue
+
+        kd = cKDTree(pts)
+        _, nn_idx = kd.query(pts, k=min(k + 1, len(pts)))
+        nn_idx = nn_idx[:, 1:]
+
+        scores = np.zeros(len(pts), dtype=np.float32)
+        for i in range(len(pts)):
+            neighbours = pts[nn_idx[i]]
+            centred    = neighbours - neighbours.mean(axis=0)
+            cov        = (centred.T @ centred) / max(len(neighbours) - 1, 1)
+            eigvals    = np.sort(np.linalg.eigvalsh(cov))[::-1]
+            l1, l2, _  = eigvals
+            scores[i]  = float((l1 - l2) / (l1 + 1e-9))
+
+        stem_scores[idx] = scores
+
+    return stem_scores
 
 
 # ═══════════════════════════════════════════════════════════
@@ -594,7 +613,7 @@ def generate_distinct_colours(n):
 
 def save_segment_summary_csv(
     path, n_trees, tree_top_lookup, score_lookup, radial_stats,
-    raw_counts, density_counts, final_counts
+    raw_counts, density_counts, final_counts, crown_lookup=None
 ):
     """Write one row per detected treetop to the segment summary CSV."""
     fieldnames = [
@@ -608,8 +627,12 @@ def save_segment_summary_csv(
         # Shape QC
         'pca_linearity', 'pca_verticality',
         'n_centroid_slices', 'mean_centroid_drift_m', 'max_centroid_drift_m',
-        'failures', 'fail_reasons', 'segment_status', 'segment_qc_tier'
+        'failures', 'fail_reasons', 'segment_status', 'segment_qc_tier',
+        # Crown area from the watershed catchment (Phase 2)
+        'crown_area_m2', 'crown_diam_m', 'crown_n_pixels'
     ]
+    crown_lookup = crown_lookup or {}
+    default_crown = {'crown_area_m2': np.nan, 'crown_diam_m': np.nan, 'crown_n_pixels': 0}
 
     def _f(v, decimals=3):
         """Format float, returning '' for NaN."""
@@ -643,6 +666,7 @@ def save_segment_summary_csv(
             tt  = tree_top_lookup.get(tree_id, {'tree_top_x': np.nan, 'tree_top_y': np.nan, 'canopy_height_m': np.nan})
             sc  = score_lookup.get(tree_id, default_score)
             rad = radial_stats.get(tree_id, default_radial)
+            cr  = crown_lookup.get(tree_id, default_crown)
             writer.writerow({
                 'tree_id':              tree_id,
                 'tree_top_x':          _f(tt['tree_top_x']),
@@ -668,7 +692,10 @@ def save_segment_summary_csv(
                 'failures':            _i(sc['failures']),
                 'fail_reasons':        sc['fail_reasons'],
                 'segment_status':      sc['segment_status'],
-                'segment_qc_tier':     sc['segment_qc_tier']
+                'segment_qc_tier':     sc['segment_qc_tier'],
+                'crown_area_m2':       _f(cr['crown_area_m2'], 4),
+                'crown_diam_m':        _f(cr['crown_diam_m']),
+                'crown_n_pixels':      _i(cr['crown_n_pixels']),
             })
 
 
@@ -745,11 +772,14 @@ def save_treetops_csv(path, tree_top_x, tree_top_y, tree_top_z_true):
     print(f"  Treetops CSV saved: {path}  ({len(tree_top_x)} rows)")
 
 
-def save_candidate_las(path, final_x, final_y, final_z, final_ids, r, g, b):
+def save_candidate_las(path, final_x, final_y, final_z, final_ids, r, g, b,
+                        stem_scores=None):
     """
     Save the final candidate lower-stem cloud.
-    Intentionally does NOT include dbh_m — that is the job of dbh_extraction_v2.py.
-    Note: the radial filter has already been applied to this cloud.
+    Intentionally does NOT include dbh_m — that is the job of dbh_extraction.
+    Note: the radial (and verticality) filter has already been applied here.
+    The per-point verticality score is carried as the `stem_score` extra dim so
+    downstream tools can weight or audit points without recomputing it.
     """
     header = laspy.LasHeader(point_format=7, version='1.4')
     header.scales  = np.array([0.001, 0.001, 0.001])
@@ -760,8 +790,11 @@ def save_candidate_las(path, final_x, final_y, final_z, final_ids, r, g, b):
     ])
     out = laspy.LasData(header=header)
     out.x = final_x; out.y = final_y; out.z = final_z
-    out.add_extra_dim(laspy.ExtraBytesParams(name='tree_id', type=np.int32))
-    out.tree_id = final_ids.astype(np.int32)
+    out.add_extra_dim(laspy.ExtraBytesParams(name='tree_id',    type=np.int32))
+    out.add_extra_dim(laspy.ExtraBytesParams(name='stem_score', type=np.float32))
+    out.tree_id    = final_ids.astype(np.int32)
+    out.stem_score = (stem_scores if stem_scores is not None
+                      else np.ones(len(final_x), dtype=np.float32)).astype(np.float32)
     out.red = r; out.green = g; out.blue = b
     out.write(path)
 
@@ -890,6 +923,183 @@ def _count_lookup(ids_array):
 # MAIN
 # ═══════════════════════════════════════════════════════════
 
+
+# ===========================================================
+# DETECTION SUMMARY + STEM-QUALITY LAYER (presentation outputs)
+# Both are assembled from structures the run paths already hold,
+# so no extra pass over the cloud and segment_region is untouched.
+# ===========================================================
+
+def _canopy_heights(ids, tree_top_lookup):
+    hs = []
+    for tid in ids:
+        tt = tree_top_lookup.get(int(tid))
+        if tt is not None:
+            h = tt.get('canopy_height_m')
+            if h is not None and not np.isnan(h):
+                hs.append(float(h))
+    return np.array(hs, dtype=float)
+
+
+def compute_crown_areas(watershed_labels, n_trees, resolution):
+    """Per-tree crown area from the watershed catchment: (pixels labelled for the
+    tree) x cell area. This is the true crown extent - every canopy pixel assigned
+    to the tree - not the filtered lower-stem footprint. Standard ITC crown-area
+    method; near-free since it reuses the watershed raster already in memory.
+    crown_diam_m is the equivalent-circle diameter 2*sqrt(area/pi)."""
+    counts    = np.bincount(watershed_labels.ravel(), minlength=n_trees + 1)
+    cell_area = float(resolution) ** 2
+    out = {}
+    for tid in range(1, n_trees + 1):
+        npix = int(counts[tid]) if tid < len(counts) else 0
+        if npix > 0:
+            area = npix * cell_area
+            diam = 2.0 * float(np.sqrt(area / np.pi))
+            out[tid] = {'crown_area_m2': round(area, 4),
+                        'crown_diam_m':  round(diam, 3),
+                        'crown_n_pixels': npix}
+        else:
+            out[tid] = {'crown_area_m2': np.nan, 'crown_diam_m': np.nan,
+                        'crown_n_pixels': 0}
+    return out
+
+
+def build_detection_metrics(tree_ids_iter, tree_top_lookup, score_lookup,
+                            radial_stats, raw_counts, density_counts,
+                            final_counts, n_treetops, crown_lookup=None):
+    """Stand-detection metrics for the site-page cards (stored in
+    lidar_analyses.summary). Pure aggregation of existing structures."""
+    ids = [int(t) for t in tree_ids_iter]
+    heights = _canopy_heights(ids, tree_top_lookup)
+
+    tiers = {'good': 0, 'moderate': 0, 'failed': 0}
+    for tid in ids:
+        tier = score_lookup.get(tid, {}).get('segment_qc_tier', 'failed')
+        tiers[tier] = tiers.get(tier, 0) + 1
+
+    retentions = [
+        radial_stats[tid]['radial_retention_frac']
+        for tid in ids
+        if tid in radial_stats
+        and radial_stats[tid].get('radial_retention_frac') is not None
+        and not np.isnan(radial_stats[tid]['radial_retention_frac'])
+    ]
+    radial_removed = int(sum(
+        radial_stats[tid].get('radial_n_removed', 0)
+        for tid in ids if tid in radial_stats
+    ))
+
+    crown_lookup = crown_lookup or {}
+    crown_areas = np.array([
+        crown_lookup[tid]['crown_area_m2']
+        for tid in ids
+        if tid in crown_lookup
+        and crown_lookup[tid].get('crown_area_m2') is not None
+        and not np.isnan(crown_lookup[tid]['crown_area_m2'])
+    ], dtype=float)
+    crown_diams = np.array([
+        crown_lookup[tid]['crown_diam_m']
+        for tid in ids
+        if tid in crown_lookup
+        and crown_lookup[tid].get('crown_diam_m') is not None
+        and not np.isnan(crown_lookup[tid]['crown_diam_m'])
+    ], dtype=float)
+
+    def _p(a, q):
+        return round(float(np.percentile(a, q)), 2) if len(a) else None
+
+    return {
+        'trees':                 len(ids),
+        'n_treetops_detected':   int(n_treetops),
+        'n_candidates_accepted': len(ids),
+        'canopy_height_mean_m':  round(float(np.mean(heights)), 2) if len(heights) else None,
+        'canopy_height_std_m':   round(float(np.std(heights)), 2) if len(heights) else None,
+        'canopy_height_min_m':   round(float(np.min(heights)), 2) if len(heights) else None,
+        'canopy_height_max_m':   round(float(np.max(heights)), 2) if len(heights) else None,
+        'canopy_height_p25_m':   _p(heights, 25),
+        'canopy_height_p75_m':   _p(heights, 75),
+        'segment_tier_good':     tiers['good'],
+        'segment_tier_moderate': tiers['moderate'],
+        'segment_tier_failed':   tiers['failed'],
+        'n_stem_points_raw':          int(sum(raw_counts.values())),
+        'n_stem_points_post_density': int(sum(density_counts.values())),
+        'n_stem_points_final':        int(sum(final_counts.values())),
+        'radial_points_removed':      radial_removed,
+        'radial_mean_retention_frac': round(float(np.mean(retentions)), 4) if retentions else None,
+        'crown_area_total_m2': round(float(np.sum(crown_areas)), 2) if len(crown_areas) else None,
+        'crown_area_mean_m2':  round(float(np.mean(crown_areas)), 2) if len(crown_areas) else None,
+        'crown_diam_mean_m':   round(float(np.mean(crown_diams)), 2) if len(crown_diams) else None,
+        'params': {
+            'chm_resolution_m':     CHM_RESOLUTION,
+            'hmin_m':               HMIN,
+            'stem_height_band_m':   f'{STEM_MIN_H}-{STEM_MAX_H}',
+            'radial_hard_radius_m': RADIAL_HARD_RADIUS,
+            'vert_min_score':       VERT_MIN_SCORE if APPLY_VERTICALITY_FILTER else None,
+        },
+    }
+
+
+def save_detection_summary_json(path, metrics):
+    with open(path, 'w') as f:
+        json.dump(metrics, f)
+    print(f"Detection summary JSON saved: {path}")
+
+
+def save_stem_quality_geojson(path, crs, tree_ids_iter, tree_top_lookup,
+                              score_lookup, radial_stats, final_counts,
+                              crown_lookup=None):
+    """Per-tree stem-quality map layer: one WGS84 point per accepted tree at
+    its treetop, carrying the confidence signal the improved model produces."""
+    ids, xs, ys = [], [], []
+    for tid in tree_ids_iter:
+        tid = int(tid)
+        tt = tree_top_lookup.get(tid)
+        if not tt:
+            continue
+        cx, cy = tt.get('tree_top_x'), tt.get('tree_top_y')
+        if cx is None or cy is None or np.isnan(cx) or np.isnan(cy):
+            continue
+        ids.append(tid); xs.append(float(cx)); ys.append(float(cy))
+
+    if not ids:
+        with open(path, 'w') as f:
+            json.dump({'type': 'FeatureCollection', 'features': []}, f)
+        print(f"Stem-quality GeoJSON (0 trees): {path}")
+        return
+
+    crown_lookup = crown_lookup or {}
+    lons, lats = warp_transform(crs, 'EPSG:4326', xs, ys)
+    features = []
+    for tid, lon, lat in zip(ids, lons, lats):
+        tt   = tree_top_lookup[tid]
+        sc   = score_lookup.get(tid, {})
+        rs   = radial_stats.get(tid, {})
+        cr   = crown_lookup.get(tid, {})
+        h    = tt.get('canopy_height_m')
+        vert = sc.get('pca_verticality')
+        ret  = rs.get('radial_retention_frac')
+        ca   = cr.get('crown_area_m2')
+        cd   = cr.get('crown_diam_m')
+        features.append({
+            'type': 'Feature',
+            'geometry': {'type': 'Point',
+                         'coordinates': [round(float(lon), 7), round(float(lat), 7)]},
+            'properties': {
+                'tree_id':                tid,
+                'canopy_height_m':        round(float(h), 1) if h is not None and not np.isnan(h) else None,
+                'segment_qc_tier':        sc.get('segment_qc_tier', 'failed'),
+                'pca_verticality':        round(float(vert), 3) if vert is not None and not np.isnan(vert) else None,
+                'radial_retention_frac':  round(float(ret), 3) if ret is not None and not np.isnan(ret) else None,
+                'crown_area_m2':          round(float(ca), 2) if ca is not None and not np.isnan(ca) else None,
+                'crown_diam_m':           round(float(cd), 2) if cd is not None and not np.isnan(cd) else None,
+                'n_points_final':         int(final_counts.get(tid, 0)),
+            },
+        })
+    with open(path, 'w') as f:
+        json.dump({'type': 'FeatureCollection', 'features': features}, f)
+    print(f"Stem-quality GeoJSON ({len(features):,} trees): {path}")
+
+
 def run_single_pass():
     """Original full-cloud path: read the whole cloud, segment, and write every
     output including the diagnostic LAS and top-view PNG. Used when the cloud fits
@@ -942,6 +1152,7 @@ def run_single_pass():
 
     chm_watershed = watershed(-chm_smooth, markers=seeds, mask=chm_smooth >= HMIN)
     print(f"Watershed labels: {chm_watershed.max():,}")
+    crown_lookup = compute_crown_areas(chm_watershed, n_trees, CHM_RESOLUTION)
 
     # ── 5. Stem candidate extraction + ID assignment ──────
     print("Extracting lower-stem candidates...")
@@ -984,17 +1195,7 @@ def run_single_pass():
     )
     print(f"After scoring: {len(valid_trees_final):,} accepted candidate segments")
 
-    # ── 8. Radial consistency filter ──────────────────────
-    radial_stats = {}
-    if APPLY_RADIAL_FILTER:
-        print("Applying radial consistency filter...")
-        tree_ids, radial_stats = apply_radial_filter(
-            stem_x, stem_y, tree_ids, valid_trees_final, score_lookup
-        )
-
-    final_counts = _count_lookup(tree_ids)
-
-    # ── 9. Build treetop lookup ───────────────────────────
+    # ── 8. Build treetop lookup (before the radial filter) ─
     tree_top_lookup = {
         i + 1: {
             'tree_top_x':    float(ttx[i]),
@@ -1004,12 +1205,35 @@ def run_single_pass():
         for i in range(n_trees)
     }
 
+    # ── 9. Radial consistency filter (treetop-centred) ────
+    radial_stats = {}
+    if APPLY_RADIAL_FILTER:
+        print("Applying radial consistency filter...")
+        tree_ids, radial_stats = apply_radial_filter(
+            stem_x, stem_y, tree_ids, valid_trees_final, score_lookup, tree_top_lookup
+        )
+
+    # ── 9b. Per-point verticality filter ──────────────────
+    stem_scores = np.zeros(len(stem_x), dtype=np.float32)
+    if APPLY_VERTICALITY_FILTER:
+        print("Computing per-point verticality scores...")
+        stem_scores = compute_point_verticality(
+            stem_x, stem_y, stem_z, tree_ids, k=K_VERT
+        )
+        low_vert = (stem_scores < VERT_MIN_SCORE) & (tree_ids > 0)
+        n_removed_vert = int(low_vert.sum())
+        tree_ids[low_vert] = 0
+        print(f"  Verticality filter removed {n_removed_vert:,} points "
+              f"({n_removed_vert / max(len(stem_x), 1) * 100:.1f}%)")
+
+    final_counts = _count_lookup(tree_ids)
+
     # ── 10. Segment summary CSV ───────────────────────────
     print("Saving segment summary CSV...")
     save_segment_summary_csv(
         SEGMENT_SUMMARY_CSV, n_trees, tree_top_lookup,
         score_lookup, radial_stats,
-        raw_counts, density_counts, final_counts
+        raw_counts, density_counts, final_counts, crown_lookup
     )
     print(f"Segment summary saved: {SEGMENT_SUMMARY_CSV}")
 
@@ -1066,11 +1290,23 @@ def run_single_pass():
     save_candidate_las(
         OUTPUT_FILE,
         final_x, final_y, final_z, final_ids,
-        pr[final_mask], pg[final_mask], pb[final_mask]
+        pr[final_mask], pg[final_mask], pb[final_mask],
+        stem_scores=stem_scores[final_mask]
     )
     print(f"Candidate LAS saved: {OUTPUT_FILE}")
     print(f"  Points: {final_mask.sum():,}  |  Trees: {len(valid_trees_final):,}")
     print("  Note: radial filter has been applied. See segment summary CSV for per-tree retention stats.")
+
+    # ── 16. Presentation outputs: detection summary + stem-quality layer ──
+    if SUMMARY_JSON is not None:
+        metrics = build_detection_metrics(
+            valid_trees_final, tree_top_lookup, score_lookup, radial_stats,
+            raw_counts, density_counts, final_counts, n_trees, crown_lookup)
+        save_detection_summary_json(SUMMARY_JSON, metrics)
+    if QUALITY_GEOJSON is not None:
+        save_stem_quality_geojson(
+            QUALITY_GEOJSON, OUTPUT_CRS, valid_trees_final, tree_top_lookup,
+            score_lookup, radial_stats, final_counts, crown_lookup)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1095,7 +1331,8 @@ def segment_region(x, y, z):
         'raw_counts': {}, 'density_counts': {}, 'final_counts': {},
         'valid_trees_final': np.zeros(0, dtype=np.int32),
         'final_x': np.zeros(0), 'final_y': np.zeros(0), 'final_z': np.zeros(0),
-        'final_ids': np.zeros(0, dtype=np.int32),
+        'final_ids': np.zeros(0, dtype=np.int32), 'final_scores': np.zeros(0),
+        'crown_lookup': {},
     }
     if n_in == 0:
         return empty
@@ -1121,6 +1358,7 @@ def segment_region(x, y, z):
     for i in range(n_trees):
         seeds[tt_rows[i], tt_cols[i]] = i + 1
     chm_watershed = watershed(-chm_smooth, markers=seeds, mask=chm_smooth >= HMIN)
+    crown_lookup = compute_crown_areas(chm_watershed, n_trees, CHM_RESOLUTION)
 
     stem_x, stem_y, stem_z, stem_mask = extract_stem_candidates(
         x, y, z, STEM_MIN_H, STEM_MAX_H)
@@ -1143,17 +1381,29 @@ def segment_region(x, y, z):
     valid_trees_final = np.array(
         [int(t) for t in valid_trees if int(t) not in rejected_ids], dtype=np.int32)
 
-    radial_stats = {}
-    if APPLY_RADIAL_FILTER:
-        tree_ids, radial_stats = apply_radial_filter(
-            stem_x, stem_y, tree_ids, valid_trees_final, score_lookup)
-    final_counts = _count_lookup(tree_ids)
-
+    # Treetop lookup is built BEFORE the radial filter, which now centres on the
+    # treetop (falling back to the provisional seed only when a treetop is absent).
     tree_top_lookup = {
         i + 1: {'tree_top_x': float(ttx[i]), 'tree_top_y': float(tty[i]),
                 'canopy_height_m': float(ttz_true[i])}
         for i in range(n_trees)
     }
+
+    radial_stats = {}
+    if APPLY_RADIAL_FILTER:
+        tree_ids, radial_stats = apply_radial_filter(
+            stem_x, stem_y, tree_ids, valid_trees_final, score_lookup, tree_top_lookup)
+
+    # Per-point verticality filter: score every stem point, drop the non-vertical
+    # ones, and carry the score through to the candidate LAS via final_scores.
+    stem_scores = np.zeros(len(stem_x), dtype=np.float32)
+    if APPLY_VERTICALITY_FILTER:
+        stem_scores = compute_point_verticality(
+            stem_x, stem_y, stem_z, tree_ids, k=K_VERT)
+        low_vert = (stem_scores < VERT_MIN_SCORE) & (tree_ids > 0)
+        tree_ids[low_vert] = 0
+
+    final_counts = _count_lookup(tree_ids)
 
     final_mask = tree_ids > 0
     return {
@@ -1164,6 +1414,8 @@ def segment_region(x, y, z):
         'valid_trees_final': valid_trees_final,
         'final_x': stem_x[final_mask], 'final_y': stem_y[final_mask],
         'final_z': stem_z[final_mask], 'final_ids': tree_ids[final_mask],
+        'final_scores': stem_scores[final_mask],
+        'crown_lookup': crown_lookup,
     }
 
 
@@ -1187,8 +1439,10 @@ def run_tiled():
 
     g_ttx, g_tty, g_ttz = [], [], []
     g_tree_top_lookup, g_score, g_radial = {}, {}, {}
+    g_crown = {}
     g_raw, g_density, g_final = {}, {}, {}
     g_fx, g_fy, g_fz, g_fid = [], [], [], []
+    g_fscore = []
     next_id = 1
     n_tiles = 0
 
@@ -1225,6 +1479,8 @@ def run_tiled():
                 g_score[gid] = R['score_lookup'][lid]
             if lid in R['radial_stats']:
                 g_radial[gid] = R['radial_stats'][lid]
+            if lid in R['crown_lookup']:
+                g_crown[gid] = R['crown_lookup'][lid]
             g_raw[gid] = R['raw_counts'].get(lid, 0)
             g_density[gid] = R['density_counts'].get(lid, 0)
             g_final[gid] = R['final_counts'].get(lid, 0)
@@ -1240,6 +1496,7 @@ def run_tiled():
                 g_fy.append(R['final_y'][keep])
                 g_fz.append(R['final_z'][keep])
                 g_fid.append(fid_global)
+                g_fscore.append(R['final_scores'][keep])
 
         print(f"  tile ({t['i']},{t['j']}): trees(core)={len(local_to_global)} "
               f"running_total={next_id - 1}", flush=True)
@@ -1256,11 +1513,13 @@ def run_tiled():
         final_y = np.concatenate(g_fy)
         final_z = np.concatenate(g_fz)
         final_ids = np.concatenate(g_fid)
+        final_scores = np.concatenate(g_fscore)
     else:
         final_x = np.zeros(0)
         final_y = np.zeros(0)
         final_z = np.zeros(0)
         final_ids = np.zeros(0, dtype=np.int32)
+        final_scores = np.zeros(0, dtype=np.float32)
 
     print(f"[segmentation] merged: {n_trees_global:,} trees | "
           f"{len(final_x):,} stem-candidate points across {n_tiles} tiles", flush=True)
@@ -1268,7 +1527,7 @@ def run_tiled():
     print("Saving segment summary CSV...")
     save_segment_summary_csv(
         SEGMENT_SUMMARY_CSV, n_trees_global, g_tree_top_lookup,
-        g_score, g_radial, g_raw, g_density, g_final)
+        g_score, g_radial, g_raw, g_density, g_final, g_crown)
     print(f"Segment summary saved: {SEGMENT_SUMMARY_CSV}")
 
     print("Exporting treetop poles...")
@@ -1292,10 +1551,23 @@ def run_tiled():
     pb = point_colours[:, 2]
 
     print("Saving final candidate LAS...")
-    save_candidate_las(OUTPUT_FILE, final_x, final_y, final_z, final_ids, pr, pg, pb)
+    save_candidate_las(OUTPUT_FILE, final_x, final_y, final_z, final_ids, pr, pg, pb,
+                       stem_scores=final_scores)
     print(f"Candidate LAS saved: {OUTPUT_FILE}")
     print(f"  Points: {len(final_x):,}  |  Trees: {n_trees_global:,}  |  Tiles: {n_tiles}")
     print("  Note: tiled mode - diagnostic LAS and top-view PNG are skipped.")
+
+    # Presentation outputs: detection summary + stem-quality layer (merged global trees)
+    global_ids = list(g_tree_top_lookup.keys())
+    if SUMMARY_JSON is not None:
+        metrics = build_detection_metrics(
+            global_ids, g_tree_top_lookup, g_score, g_radial,
+            g_raw, g_density, g_final, n_trees_global, g_crown)
+        save_detection_summary_json(SUMMARY_JSON, metrics)
+    if QUALITY_GEOJSON is not None:
+        save_stem_quality_geojson(
+            QUALITY_GEOJSON, OUTPUT_CRS, global_ids, g_tree_top_lookup,
+            g_score, g_radial, g_final, g_crown)
 
 
 def main():

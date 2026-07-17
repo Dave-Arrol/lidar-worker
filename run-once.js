@@ -59,8 +59,13 @@ async function main() {
       console.error('[run-once] analyse needs { cloudJobId, analyses[] }'); process.exit(2)
     }
     await runAnalyses(p.cloudJobId, p.analyses)
+  } else if (MODE === 'harvest') {
+    if (!p.quoteId) { console.error('[run-once] harvest needs { quoteId }'); process.exit(2) }
+    // Self-contained handler; writes its own queued->processing->ready|failed status.
+    const { runHarvestQuote } = require('./harvest_quote.js')
+    await runHarvestQuote(p)
   } else {
-    console.error(`[run-once] unknown MODE '${MODE}' (expected ingest | process | analyse)`); process.exit(2)
+    console.error(`[run-once] unknown MODE '${MODE}' (expected ingest | process | analyse | harvest)`); process.exit(2)
   }
 }
 

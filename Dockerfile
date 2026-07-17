@@ -50,8 +50,11 @@ ENV LD_LIBRARY_PATH=/opt/potree
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
-COPY index.js registry.js run-once.js ./
+COPY index.js registry.js run-once.js harvest_quote.js ./
 COPY scripts ./scripts
+# Harvest Planner (feature #11): the 3 MB sklearn model + the validated v1
+# predict tool. pandas/scikit-learn/numpy are already in the Python stack above.
+COPY harvest ./harvest
 ENV PORT=8080
 EXPOSE 8080
 CMD ["node", "index.js"]
