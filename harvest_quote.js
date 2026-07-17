@@ -30,6 +30,9 @@ const S3_BUCKET = clean(process.env.S3_BUCKET) || 'arrol-lidar'
 const AWS_REGION = clean(process.env.AWS_REGION) || 'eu-west-2'
 const MODEL_PATH = clean(process.env.HARVEST_MODEL_PATH) || '/app/harvest/model.pkl'
 const PREDICT_SCRIPT = clean(process.env.HARVEST_PREDICT_SCRIPT) || '/app/harvest/predict_coupe.py'
+const EXTRACT_TERRAIN = clean(process.env.HARVEST_EXTRACT_TERRAIN) || '/app/harvest/extract_terrain.py'
+const OS_TILES_SCRIPT = clean(process.env.HARVEST_OS_TILES) || '/app/harvest/os_tiles_for_stems.py'
+const TERR50_PREFIX = clean(process.env.HARVEST_TERR50_PREFIX) || 'terr50_gagg_gb/'
 
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -159,6 +162,102 @@ async function markFailed(quoteId, err) {
   }).eq('id', quoteId)
 }
 
+
+// ---- forecast stems from LiDAR-detected trees (Stage C) -------------------
+// For a coupe with no felled stems, quote from the LiDAR mensuration analysis:
+// per-tree DBH + volume + position via the harvest_lidar_stems RPC. Species is
+// a coupe-level assumption (the model only splits Spruce vs non-Spruce).
+async function stemsFromLidar(siteId, csvPath, species, cloudJobId) {
+  const { data, error } = await supabase.rpc('harvest_lidar_stems',
+    { p_site_id: siteId, p_cloud_job_id: cloudJobId || null })
+  if (error) throw new Error(`harvest_lidar_stems failed: ${error.message}`)
+  if (!data || !data.length) {
+    throw new Error(`no LiDAR trees for site ${siteId} - run the DBH + volume analysis first`)
+  }
+  const header = ['object_id', 'stem_key', 'dbh_cm', 'stem_volume_m3', 'species', 'lat', 'lon']
+  const sp = species || 'Spruce'
+  const rows = data
+    .filter((tr) => tr.lat != null && tr.lon != null)
+    .map((tr) => ({
+      object_id: siteId,
+      stem_key: tr.tree_id,
+      dbh_cm: tr.dbh_cm,
+      stem_volume_m3: tr.volume_m3,
+      species: sp,
+      lat: tr.lat,
+      lon: tr.lon,
+    }))
+  if (!rows.length) throw new Error(`LiDAR trees for site ${siteId} have no coordinates`)
+  await writeCsv(csvPath, header, rows)
+  return { count: rows.length, cloudJobId: data[0].cloud_job_id || null }
+}
+
+// ---- OS Terrain 50 enrichment ---------------------------------------------
+// Populate the six _os5 features on each stem so the model runs with terrain
+// signal instead of terrain-blind. Reuses extract_terrain.py's validated os5
+// sampler (identical to how the model was trained), fetching only the OS tiles
+// covering this coupe's bbox from S3. Degrades gracefully: any failure returns
+// the un-enriched stems and the quote still runs (just at the wider band).
+const OS5_COLS = ['elev_m', 'slope_deg', 'aspect_northness', 'aspect_eastness', 'roughness_m', 'tpi_m']
+
+async function mergeOs5(stemsCsv, terrainCsv, outCsv) {
+  const stems = parseCsv(await fsp.readFile(stemsCsv, 'utf8'))
+  const terr = parseCsv(await fsp.readFile(terrainCsv, 'utf8'))
+  const key = (r) => `${r.object_id}|${r.stem_key}`
+  const byKey = new Map(terr.map((r) => [key(r), r]))
+
+  const header = Object.keys(stems[0] || {}).concat(OS5_COLS.map((c) => `${c}_os5`))
+  let sampled = 0
+  for (const s of stems) {
+    const m = byKey.get(key(s))
+    for (const c of OS5_COLS) {
+      const v = m ? m[c] : ''
+      s[`${c}_os5`] = (v === '' || v == null || v === 'nan') ? '' : v
+    }
+    if (s['slope_deg_os5'] !== '') sampled += 1
+  }
+  await writeCsv(outCsv, header, stems)
+  return stems.length ? sampled / stems.length : 0
+}
+
+async function enrichTerrainOS50(work, stemsCsv) {
+  try {
+    // which OS 10 km tiles cover the coupe?
+    const refsOut = await run('python3', [OS_TILES_SCRIPT, '--stems', stemsCsv])
+    const refs = refsOut.trim().split(/\s+/).filter(Boolean)
+    if (!refs.length) { console.log('[harvest] no coords -> terrain-blind quote'); return { path: stemsCsv, source: 'none', coverage: 0 } }
+
+    // list the terr50 prefix once and keep the tiles whose filename matches a ref
+    const listing = await run('aws', ['s3', 'ls', `s3://${S3_BUCKET}/${TERR50_PREFIX}`, '--recursive', '--region', AWS_REGION])
+    const keys = listing.split('\n')
+      .map((l) => l.trim().split(/\s+/).slice(3).join(' '))
+      .filter(Boolean)
+    const wanted = keys.filter((k) => {
+      const base = (k.split('/').pop() || '').toLowerCase()
+      return refs.some((r) => base.startsWith(r))
+    })
+    if (!wanted.length) { console.log(`[harvest] no OS tiles matched [${refs.join(',')}] -> terrain-blind`); return { path: stemsCsv, source: 'none', coverage: 0 } }
+
+    const tilesDir = path.join(work, 'terr50')
+    await fsp.mkdir(tilesDir, { recursive: true })
+    for (const k of wanted) {
+      await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${k}`, path.join(tilesDir, k.split('/').pop()), '--no-progress', '--region', AWS_REGION])
+    }
+    console.log(`[harvest] fetched ${wanted.length} OS tile(s) for [${refs.join(',')}]`)
+
+    // sample the six _os5 features with the validated extractor, then merge
+    const terrainCsv = path.join(work, 'terrain_os5.csv')
+    await run('python3', [EXTRACT_TERRAIN, 'os5', '--stems', stemsCsv, '--dtm', tilesDir, '--out', terrainCsv])
+    const enriched = path.join(work, 'stems_enriched.csv')
+    const coverage = await mergeOs5(stemsCsv, terrainCsv, enriched)
+    console.log(`[harvest] OS50 terrain applied to ${(coverage * 100).toFixed(0)}% of stems`)
+    return { path: enriched, source: 'os50', coverage }
+  } catch (e) {
+    console.log('[harvest] terrain enrichment failed, falling back to terrain-blind:', e.message)
+    return { path: stemsCsv, source: 'none', coverage: 0 }
+  }
+}
+
 async function runHarvestQuote(payload) {
   if (!supabase) throw new Error('Supabase env not configured (SUPABASE_URL / SERVICE_ROLE_KEY)')
   const { quoteId, siteId, source = 'coupe', stemsKey, machineRate, fuelPrice } = payload || {}
@@ -177,6 +276,7 @@ async function runHarvestQuote(payload) {
   }).eq('id', quoteId)
 
   const work = await fsp.mkdtemp(path.join(os.tmpdir(), 'harvest-'))
+  let usedCloudJobId = null
   try {
     const stemsCsv = path.join(work, 'stems.csv')
     const outCsv = path.join(work, 'quote.csv')
@@ -186,6 +286,13 @@ async function runHarvestQuote(payload) {
       if (!stemsKey && !quote.stems_key) throw new Error('upload source needs a stems_key')
       const key = stemsKey || quote.stems_key
       await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${key}`, stemsCsv, '--no-progress', '--region', AWS_REGION])
+    } else if (source === 'lidar') {
+      const sid = siteId || quote.site_id
+      if (!sid) throw new Error('lidar source needs a site_id')
+      const lr = await stemsFromLidar(sid, stemsCsv, quote.species || payload.species,
+        quote.cloud_job_id || payload.cloudJobId)
+      usedCloudJobId = lr.cloudJobId
+      console.log(`[harvest] pulled ${lr.count} forecast stems from LiDAR cloud ${usedCloudJobId} for site ${sid}`)
     } else {
       const sid = siteId || quote.site_id
       if (!sid) throw new Error('coupe source needs a site_id')
@@ -193,11 +300,14 @@ async function runHarvestQuote(payload) {
       console.log(`[harvest] pulled ${n} stems from harvested_stems for site ${sid}`)
     }
 
-    // 2) run the validated predict tool
+    // 2) enrich with OS Terrain 50 (falls back to raw stems on any failure)
+    const enr = await enrichTerrainOS50(work, stemsCsv)
+
+    // 3) run the validated predict tool on the enriched stems
     await run('python3', [
       PREDICT_SCRIPT,
       '--model', MODEL_PATH,
-      '--stems', stemsCsv,
+      '--stems', enr.path,
       '--out', outCsv,
       '--machine-rate', String(rate),
       '--fuel-price', String(fuel),
@@ -213,6 +323,9 @@ async function runHarvestQuote(payload) {
     // 4) persist — summary onto the quote row, per-stem into harvest_quote_stem
     await supabase.from('harvest_quote').update({
       ...agg,
+      terrain_source: enr.source,
+      os5_coverage: Math.round(enr.coverage * 1000) / 1000,
+      cloud_job_id: usedCloudJobId,
       status: 'ready',
       error: null,
       updated_at: new Date().toISOString(),
