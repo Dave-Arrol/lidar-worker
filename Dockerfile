@@ -27,6 +27,15 @@ ENV MAMBA_ROOT_PREFIX=/opt/conda
 RUN /usr/local/bin/micromamba create -y -p /opt/pdal -c conda-forge pdal untwine awscli \
     && /usr/local/bin/micromamba clean -a -y
 ENV PATH=$PATH:/opt/pdal/bin
+
+# Isolated env for the Harvest Planner. model.pkl is pickled under numpy 2.x +
+# scikit-learn 1.8, which is incompatible with the LiDAR stack's pinned numpy
+# 1.26 / sklearn 1.5 (PCG64 BitGenerator pickle format differs). Keeping it in
+# its own env lets the model load in its native version family without touching
+# the LiDAR toolchain. predict_coupe / extract_terrain / os_tiles run under this.
+RUN /usr/local/bin/micromamba create -y -p /opt/harvest -c conda-forge \
+        python=3.11 'numpy>=2,<3' scikit-learn=1.8.0 pandas pyproj \
+    && /usr/local/bin/micromamba clean -a -y
 # Python analysis libraries (CSF = cloth-simulation-filter ground filter)
 # Full algorithmic-pipeline stack (segmentation needs scikit-image; dbh/stem need
 # scikit-learn + pandas; plots need matplotlib, headless via MPLBACKEND=Agg).

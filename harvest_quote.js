@@ -33,6 +33,9 @@ const PREDICT_SCRIPT = clean(process.env.HARVEST_PREDICT_SCRIPT) || '/app/harves
 const EXTRACT_TERRAIN = clean(process.env.HARVEST_EXTRACT_TERRAIN) || '/app/harvest/extract_terrain.py'
 const OS_TILES_SCRIPT = clean(process.env.HARVEST_OS_TILES) || '/app/harvest/os_tiles_for_stems.py'
 const TERR50_PREFIX = clean(process.env.HARVEST_TERR50_PREFIX) || 'terr50_gagg_gb/'
+// The model is pickled under numpy 2 / sklearn 1.8, so harvest Python runs in
+// its own env (see Dockerfile), separate from the LiDAR numpy-1.x toolchain.
+const HARVEST_PY = clean(process.env.HARVEST_PYTHON) || '/opt/harvest/bin/python'
 
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -223,7 +226,7 @@ async function mergeOs5(stemsCsv, terrainCsv, outCsv) {
 async function enrichTerrainOS50(work, stemsCsv) {
   try {
     // which OS 10 km tiles cover the coupe?
-    const refsOut = await run('python3', [OS_TILES_SCRIPT, '--stems', stemsCsv])
+    const refsOut = await run(HARVEST_PY, [OS_TILES_SCRIPT, '--stems', stemsCsv])
     const refs = refsOut.trim().split(/\s+/).filter(Boolean)
     if (!refs.length) { console.log('[harvest] no coords -> terrain-blind quote'); return { path: stemsCsv, source: 'none', coverage: 0 } }
 
@@ -247,7 +250,7 @@ async function enrichTerrainOS50(work, stemsCsv) {
 
     // sample the six _os5 features with the validated extractor, then merge
     const terrainCsv = path.join(work, 'terrain_os5.csv')
-    await run('python3', [EXTRACT_TERRAIN, 'os5', '--stems', stemsCsv, '--dtm', tilesDir, '--out', terrainCsv])
+    await run(HARVEST_PY, [EXTRACT_TERRAIN, 'os5', '--stems', stemsCsv, '--dtm', tilesDir, '--out', terrainCsv])
     const enriched = path.join(work, 'stems_enriched.csv')
     const coverage = await mergeOs5(stemsCsv, terrainCsv, enriched)
     console.log(`[harvest] OS50 terrain applied to ${(coverage * 100).toFixed(0)}% of stems`)
@@ -304,7 +307,7 @@ async function runHarvestQuote(payload) {
     const enr = await enrichTerrainOS50(work, stemsCsv)
 
     // 3) run the validated predict tool on the enriched stems
-    await run('python3', [
+    await run(HARVEST_PY, [
       PREDICT_SCRIPT,
       '--model', MODEL_PATH,
       '--stems', enr.path,
