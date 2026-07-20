@@ -166,35 +166,123 @@ async function markFailed(quoteId, err) {
 }
 
 
+// ---- manual / cruise stems ------------------------------------------------
+// Quote from aggregate cruise figures (e.g. a tender doc: N stems, total volume,
+// mean DBH, species) when there's neither machine data nor LiDAR. Synthesises a
+// stem population matching the aggregates: DBH spread ~15% around the mean, and
+// volume distributed by basal area so it sums to the given total. An optional
+// lat/lon (a coupe centroid or grid ref) gives the stand terrain features.
+function _gauss() {
+  let u = 0, v = 0
+  while (u === 0) u = Math.random()
+  while (v === 0) v = Math.random()
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
+}
+
+async function buildManualStems(csvPath, params) {
+  // A cruise can be a single aggregate OR several strata (e.g. tender compartments
+  // of different age/size). Each stratum is synthesised with its own stems / mean
+  // DBH / volume / species, then all are combined into one stem population.
+  const latShared = params.lat != null && params.lat !== '' ? Number(params.lat) : null
+  const lonShared = params.lon != null && params.lon !== '' ? Number(params.lon) : null
+  const strata = (Array.isArray(params.strata) && params.strata.length)
+    ? params.strata
+    : [{ species: params.species, nStems: params.nStems, meanDbhCm: params.meanDbhCm,
+         totalVolumeM3: params.totalVolumeM3, meanTreeVolM3: params.meanTreeVolM3 }]
+
+  const header = ['object_id', 'stem_key', 'dbh_cm', 'stem_volume_m3', 'species', 'lat', 'lon']
+  const rows = []
+  let key = 0
+  for (const s of strata) {
+    const n = Math.max(0, Math.trunc(Number(s.nStems) || 0))
+    const meanDbh = Number(s.meanDbhCm) || 0
+    if (n < 1 || meanDbh <= 0) continue
+    const totalVol = s.totalVolumeM3 != null && s.totalVolumeM3 !== '' ? Number(s.totalVolumeM3)
+      : (s.meanTreeVolM3 != null ? Number(s.meanTreeVolM3) * n : null)
+    if (!totalVol || totalVol <= 0) continue
+    const sp = s.species || params.species || 'Spruce'
+    const lat = s.lat != null && s.lat !== '' ? Number(s.lat) : latShared
+    const lon = s.lon != null && s.lon !== '' ? Number(s.lon) : lonShared
+
+    const dbh = new Array(n)
+    let wsum = 0
+    for (let i = 0; i < n; i++) {
+      let d = meanDbh + _gauss() * 0.15 * meanDbh
+      d = Math.min(Math.max(d, 7), meanDbh * 2.5)
+      dbh[i] = d
+      wsum += d * d
+    }
+    for (let i = 0; i < n; i++) {
+      key += 1
+      rows.push({
+        object_id: 'manual',
+        stem_key: key,
+        dbh_cm: Math.round(dbh[i] * 10) / 10,
+        stem_volume_m3: Math.round((totalVol * (dbh[i] * dbh[i]) / wsum) * 10000) / 10000,
+        species: sp,
+        lat: lat != null ? lat : '',
+        lon: lon != null ? lon : '',
+      })
+    }
+  }
+  if (!rows.length) throw new Error('manual quote needs at least one stratum with stems, mean DBH and volume')
+  await writeCsv(csvPath, header, rows)
+  return rows.length
+}
+
 // ---- forecast stems from LiDAR-detected trees (Stage C) -------------------
 // For a coupe with no felled stems, quote from the LiDAR mensuration analysis:
 // per-tree DBH + volume + position via the harvest_lidar_stems RPC. Species is
 // a coupe-level assumption (the model only splits Spruce vs non-Spruce).
-async function stemsFromLidar(siteId, csvPath, species, cloudJobId) {
-  const { data, error } = await supabase.rpc('harvest_lidar_stems',
-    { p_site_id: siteId, p_cloud_job_id: cloudJobId || null })
-  if (error) throw new Error(`harvest_lidar_stems failed: ${error.message}`)
-  if (!data || !data.length) {
-    throw new Error(`no LiDAR trees for site ${siteId} - run the DBH + volume analysis first`)
+// PostgREST caps RPC (set-returning) results at db-max-rows (1000 by default), so a
+// coupe with >1000 tree tops comes back silently truncated. Page through with range().
+async function rpcAll(fn, args, pageSize = 1000) {
+  let all = []
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase.rpc(fn, args).range(from, from + pageSize - 1)
+    if (error) throw new Error(`${fn} failed: ${error.message}`)
+    if (!data || !data.length) break
+    all = all.concat(data)
+    if (data.length < pageSize) break
+    if (from > 2_000_000) break // safety valve
   }
-  const header = ['object_id', 'stem_key', 'dbh_cm', 'stem_volume_m3', 'species', 'lat', 'lon']
-  const sp = species || 'Spruce'
-  const rows = data
-    .filter((tr) => tr.lat != null && tr.lon != null)
-    .map((tr) => ({
-      object_id: siteId,
-      stem_key: tr.tree_id,
-      dbh_cm: tr.dbh_cm,
-      stem_volume_m3: tr.volume_m3,
-      species: sp,
-      lat: tr.lat,
-      lon: tr.lon,
-    }))
-  if (!rows.length) throw new Error(`LiDAR trees for site ${siteId} have no coordinates`)
-  await writeCsv(csvPath, header, rows)
-  return { count: rows.length, cloudJobId: data[0].cloud_job_id || null }
+  return all
 }
 
+async function stemsFromLidar(siteId, csvPath, species, cloudJobId) {
+  // Drive the quote off the mensuration analysis: every detected tree top (real
+  // position + real merch volume), with real circle-fit DBH where available and
+  // the coupe mean imputed elsewhere. This gives the true stem count and volume
+  // instead of the partial DBH-circle-fit subset.
+  const data = await rpcAll('harvest_coupe_trees',
+    { p_site_id: siteId, p_cloud_job_id: cloudJobId || null })
+  const pts = (data || []).filter((t) => t.lat != null && t.lon != null)
+  if (!pts.length) throw new Error('no analysed tree tops for this coupe - run the full mensuration analysis first')
+
+  const meanDbh = Number(pts[0].mean_dbh_cm) || 0
+  const sp = species || 'Spruce'
+  const oid = siteId || cloudJobId || pts[0].cloud_job_id || 'lidar'
+
+  const header = ['object_id', 'stem_key', 'dbh_cm', 'stem_volume_m3', 'species', 'lat', 'lon']
+  const rows = pts
+    .filter((t) => t.volume_m3 != null && Number(t.volume_m3) > 0)
+    .map((t) => {
+      const dbh = (t.dbh_cm != null && Number(t.dbh_cm) > 0) ? Number(t.dbh_cm) : meanDbh
+      return {
+        object_id: oid,
+        stem_key: t.tree_id,
+        dbh_cm: dbh > 0 ? Math.round(dbh * 10) / 10 : '',
+        stem_volume_m3: Math.round(Number(t.volume_m3) * 10000) / 10000,
+        species: sp,
+        lat: t.lat,
+        lon: t.lon,
+      }
+    })
+  if (!rows.length) throw new Error('coupe tree tops have no per-tree volume - run the tariff/volume analysis first')
+  await writeCsv(csvPath, header, rows)
+  console.log(`[harvest] tree-top source: ${data.length} trees fetched, ${rows.length} with volume`)
+  return { count: rows.length, cloudJobId: pts[0].cloud_job_id || cloudJobId || null }
+}
 // ---- OS Terrain 50 enrichment ---------------------------------------------
 // Populate the six _os5 features on each stem so the model runs with terrain
 // signal instead of terrain-blind. Reuses extract_terrain.py's validated os5
@@ -289,13 +377,17 @@ async function runHarvestQuote(payload) {
       if (!stemsKey && !quote.stems_key) throw new Error('upload source needs a stems_key')
       const key = stemsKey || quote.stems_key
       await run('aws', ['s3', 'cp', `s3://${S3_BUCKET}/${key}`, stemsCsv, '--no-progress', '--region', AWS_REGION])
+    } else if (source === 'manual') {
+      const n = await buildManualStems(stemsCsv, quote.inputs || payload.inputs || payload)
+      console.log(`[harvest] synthesised ${n} manual/cruise stems`)
     } else if (source === 'lidar') {
       const sid = siteId || quote.site_id
-      if (!sid) throw new Error('lidar source needs a site_id')
-      const lr = await stemsFromLidar(sid, stemsCsv, quote.species || payload.species,
-        quote.cloud_job_id || payload.cloudJobId)
+      const cjid = quote.cloud_job_id || payload.cloudJobId
+      // A cloud id alone is enough (standalone page); a coupe resolves its latest cloud.
+      if (!sid && !cjid) throw new Error('lidar source needs a cloud or a coupe')
+      const lr = await stemsFromLidar(sid, stemsCsv, quote.species || payload.species, cjid)
       usedCloudJobId = lr.cloudJobId
-      console.log(`[harvest] pulled ${lr.count} forecast stems from LiDAR cloud ${usedCloudJobId} for site ${sid}`)
+      console.log(`[harvest] pulled ${lr.count} forecast stems from LiDAR cloud ${usedCloudJobId} (site ${sid || '-'})`)
     } else {
       const sid = siteId || quote.site_id
       if (!sid) throw new Error('coupe source needs a site_id')
